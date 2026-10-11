@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pb27-vllm"
+version = "0.1.0"
+description = "vLLM out-of-tree model plug-in for PB-27 (Qwen3.8-27B with windowed attention + parallel Gated DeltaNet on the hybrid layers)"
+requires-python = ">=3.10"
+# vLLM itself is provided by the serving container (vllm/vllm-openai:v0.31.0); it is
+# deliberately not a dependency here so `pip install -e` never tries to resolve it.
+dependencies = []
+
+[project.entry-points."vllm.general_plugins"]
+pb27 = "pb27_vllm:register"
+
+[tool.setuptools.packages.find]
+include = ["pb27_vllm*"]

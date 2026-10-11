@@ -1,0 +1,4 @@
+# written into the bind-mounted source dir by `pip install -e` inside the container
+*.egg-info/
+__pycache__/
+build/
