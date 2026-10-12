@@ -21,6 +21,7 @@ INSTALL=${PB27_INSTALL:-pip}
 #   QUANT=fp8  -> --quantization fp8 (online FP8 weights)
 #   SPEC='{"method":"qwen3_5_mtp","num_speculative_tokens":3}' -> --speculative-config (MTP drafts)
 #   PB27_EAGER=0 -> drop --enforce-eager (CUDA graphs)
+#   PB27_MEMORY=blocks,block_size,decode_blocks,neighbors,rerank -> exact memory tier (pb27_vllm/memory.py); eager only in v1
 QUANT=${QUANT:-}
 SPEC=${SPEC:-}
 EAGER=${PB27_EAGER:-1}
@@ -50,6 +51,7 @@ esac
 # later steps). No speculative config: MTP for the hybrid model is step (e).
 exec ~/gpu_run.sh docker run --rm --name pb27-vllm --gpus all --ipc host --network host \
   -v "$HOME/.cache/huggingface:/root/.cache/huggingface" -e HF_HUB_OFFLINE=1 \
+  -e PB27_MEMORY="${PB27_MEMORY:-}" -e PB27_MEMORY_DEBUG="${PB27_MEMORY_DEBUG:-}" \
   -v "$HOME/.cache/huggingface:$HOME/.cache/huggingface:ro" \
   -v "$MODEL_DIR:$MOUNT:ro" -v "$HERE:/pb27_vllm" \
   --entrypoint bash "$IMAGE" -c "$setup && exec vllm serve $MOUNT \

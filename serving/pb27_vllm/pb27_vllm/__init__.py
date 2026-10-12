@@ -28,3 +28,15 @@ def register() -> None:
         "PB27ForConditionalGeneration", Qwen3_5ForConditionalGenerationConfig
     )
     MODELS_CONFIG_MAP.setdefault("PB27ForCausalLM", Qwen3_5ForCausalLMConfig)
+
+    # Exact memory tier (PB27_MEMORY env): archive bookkeeping hooks on the GPU model runner.
+    from . import memory
+
+    memory.configure_from_env()
+    if memory.MEMORY["enabled"]:
+        try:
+            memory.install_runner_hooks()
+        except Exception as exc:  # the API-server process has no runner; the engine/worker processes do
+            import logging
+
+            logging.getLogger(__name__).info("pb27 memory hooks not installed here: %s", exc)

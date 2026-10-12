@@ -78,6 +78,8 @@ from vllm.platforms import current_platform
 from vllm.tokenizers.registry import cached_tokenizer_from_config
 from vllm.v1.attention.backend import AttentionType
 
+from . import memory
+
 logger = init_logger(__name__)
 
 
@@ -248,6 +250,21 @@ class PB27WindowedAttention(Qwen3NextAttention):
 # --------------------------------------------------------------------------
 # decoder layer
 # --------------------------------------------------------------------------
+
+
+    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Qwen3NextAttention.forward (qwen3_next.py:449-460) with the exact memory tier spliced in around the
+        # attention call when PB27_MEMORY is set (pb27_vllm/memory.py); otherwise identical to the parent.
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v, gate = self._project_qkv_gate(qkv, positions)
+        if memory.MEMORY["enabled"]:
+            attn_output = memory.windowed_attention_with_memory(self.attn, q, k, v, positions)
+        else:
+            attn_output = self.attn(q, k, v)
+        if gate is not None:
+            attn_output = attn_output * torch.sigmoid(gate)
+        output, _ = self.o_proj(attn_output)
+        return output
 
 
 class PB27DecoderLayer(Qwen3_5DecoderLayer):

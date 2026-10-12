@@ -17,6 +17,8 @@ from __future__ import annotations
 import argparse
 import concurrent.futures as cf
 import json
+import os
+import random
 import re
 import shutil
 import subprocess
@@ -168,7 +170,8 @@ def ensure_image(repo: str, base: str) -> str:
 def run_tests(image: str, ws: Path, test_files: list[str], timeout: float = 900) -> tuple[dict[str, str], str]:
     cmd = ("python -m pytest -p no:cacheprovider -rA -q --no-header -o addopts='' --timeout 300 "
            + " ".join(test_files))
-    docker = ["docker", "run", "--rm", "--network", "none", "--cap-drop", "ALL",
+    name = f"pbswe-validate-{os.getpid()}-{random.randrange(1 << 30):08x}"
+    docker = ["docker", "run", "--rm", "--name", name, "--network", "none", "--cap-drop", "ALL",
               "--security-opt", "no-new-privileges:true", "--memory", "6g", "--cpus", "4",
               "-v", f"{ws}:/workspace:rw", "-w", "/workspace", "-e", "PYTHONDONTWRITEBYTECODE=1",
               image, "bash", "-lc", cmd]
@@ -176,6 +179,7 @@ def run_tests(image: str, ws: Path, test_files: list[str], timeout: float = 900)
         r = sh(docker, timeout=timeout)
         out = r.stdout + r.stderr
     except subprocess.TimeoutExpired:
+        subprocess.run(["docker", "kill", name], capture_output=True)  # the container outlives the timed-out client
         return {}, "TIMEOUT"
     status: dict[str, str] = {}
     for line in out.splitlines():

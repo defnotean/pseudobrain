@@ -8,7 +8,7 @@ a fixed 16k-token window plus an exact, retrieved memory of everything older. In
 same real-world coding score), decode is several times faster on a single desktop GPU, and context length stops being
 a property of the model.
 
-> Status: private pre-release. Numbers below are filled in from the receipts in `reports/` before the public release.
+> Status: private pre-release. Every number below has a receipt in `reports/`; the long-context ladder (1M+) is the open gate.
 
 ## What it is
 
@@ -23,11 +23,18 @@ a property of the model.
 
 ## Results (to be finalised from receipts)
 
-- **Intelligence:** lm-eval battery within stock's 95% CI; PB-SWE-Live (fail-to-pass tasks from PRs merged after the
-  model's cutoff): PB-27 __/59 vs stock 28/59.
-- **Speed (single DGX Spark, GB10):** stock FP8 __ tok/s → PB-27 NVFP4 + DFlash2 drafter __ tok/s, identical greedy output.
-- **Long context (exact rate, PB-27 vs stock):** passkey / multihop / copy at 32k, 64k, 128k, 1M: __.
-- **Memory:** KV cache capacity 3.3M tokens vs 0.88M for stock in the same GPU memory.
+- **Intelligence (served, like for like — both models NVFP4 + DFlash2 through vLLM, lm-eval 1000 items/task;
+  `reports/lmeval/`):** HellaSwag 0.733 vs 0.740, PIQA 0.817 vs 0.816, ARC-E 0.809 vs 0.800, ARC-C 0.582 vs 0.578,
+  Winogrande 0.759 vs 0.761, LAMBADA 0.728 vs 0.733 (max |Δ| 0.009, SE ≈ 0.014).
+- **Real coding (PB-SWE-Live, 59 fail-to-pass tasks from PRs merged after the model's cutoff, 100-step agent loop;
+  `reports/swe_live/`):** PB-27 26/59 vs stock 28/59; paired: 24 both, 5 stock-only, 3 PB-27-only (McNemar p ≈ 0.7).
+- **Speed (single DGX Spark GB10, NVFP4 + DFlash2 drafter, single stream):** PB-27 code 58.7 tok/s, math 48.3,
+  explanation 19.9, prose 17.1 — stock in the same config 84 / 53 / 24 / 19; the model alone 8–9; PB-27 FP8 + MTP 11–18.
+- **Memory:** attention KV per request is flat (16k window per layer) instead of growing with context; the same GPU
+  pool holds 1.68M cached tokens for PB-27 vs 1.04M for stock (NVFP4), 3.3M vs 0.88M in bf16.
+- **Long context (exact-memory tier, PyTorch path, 12 items/cell, PB-27 vs stock):** passkey 1.00/1.00/1.00 vs
+  1.00/1.00/1.00 at 32k/64k/128k; multihop 0.92/0.92/0.00 vs 0.67/0.67/0.17; copy 0.33/0.33/0.33 vs 0.58/0.33/0.33.
+  The tier inside the vLLM serve is in progress (`docs/MEMORY_SERVE.md`); the 1M+ ladder follows it.
 
 ## Repository layout
 

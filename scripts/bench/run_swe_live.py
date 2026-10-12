@@ -148,9 +148,15 @@ def grade(task: dict, diff: str) -> dict:
             return {"resolved": False, "reason": "test patch does not apply", "detail": r.stderr[-500:]}
         cmd = ("python -m pytest -p no:cacheprovider -rA -q --no-header -o addopts='' --timeout 300 "
                + " ".join(task["test_files"]))
-        r = sh(["docker", "run", "--rm", "--network", "none", "--cap-drop", "ALL", "--memory", "6g", "--cpus", "4", *USER_ARGS,
-                "-v", f"{ws}:/workspace:rw", "-w", "/workspace", "-e", "PYTHONDONTWRITEBYTECODE=1",
-                task["image"], "bash", "-lc", cmd], timeout=1200)
+        name = f"pbswe-grade-{os.getpid()}-{random.randrange(1 << 30):08x}"
+        try:
+            r = sh(["docker", "run", "--rm", "--name", name, "--network", "none", "--cap-drop", "ALL", "--memory", "6g",
+                    "--cpus", "4", *USER_ARGS, "-v", f"{ws}:/workspace:rw", "-w", "/workspace",
+                    "-e", "PYTHONDONTWRITEBYTECODE=1", task["image"], "bash", "-lc", cmd], timeout=1200)
+        except subprocess.TimeoutExpired:
+            # the client timed out but the container keeps running: kill it by its exact name
+            subprocess.run(["docker", "kill", name], capture_output=True)
+            return {"resolved": False, "reason": "test run timed out (1200s)", "detail": ""}
     status = {}
     for line in (r.stdout + r.stderr).splitlines():
         m = TEST_LINE.match(line.strip())
