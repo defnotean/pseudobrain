@@ -51,7 +51,9 @@ from vllm.model_executor.models.qwen3_5 import (
     Qwen3_5ForCausalLM,
     Qwen3_5ForCausalLMBase,
     Qwen3_5ForConditionalGeneration,
+    Qwen3_5_MoeMixtureOfExperts,
     Qwen3_5Model,
+    Qwen3_5MoeProcessingInfo,
     Qwen3_5ProcessingInfo,
 )
 from vllm.model_executor.models.qwen3_next import (
@@ -59,6 +61,7 @@ from vllm.model_executor.models.qwen3_next import (
     Qwen3NextDecoderLayer,
     Qwen3NextModel,
     Qwen3NextSparseMoeBlock,
+    QwenNextMixtureOfExperts,
 )
 from vllm.model_executor.models.qwen3_vl import (
     Qwen3_VisionTransformer,
@@ -81,6 +84,51 @@ from vllm.v1.attention.backend import AttentionType
 from . import memory
 
 logger = init_logger(__name__)
+
+
+def _install_nvfp4_scale_hooks() -> None:
+    """Fix compressed-tensors NVFP4 MoE checkpoints where gate_proj (w1) and up_proj (w3)
+    have distinct per-projection `weight_global_scale` divisors, and initialize
+    `w13_input_global_scale` / `w2_input_global_scale` to 1.0 in W4A16 (`use_a16=True`)
+    mode so `1.0 / scale` does not divide by uninitialized `torch.empty` memory."""
+    try:
+        from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4a4_nvfp4 import (
+            CompressedTensorsW4A4Nvfp4MoEMethod,
+        )
+
+        if not getattr(CompressedTensorsW4A4Nvfp4MoEMethod, "_pb27_patched", False):
+            orig_moe_pwal = CompressedTensorsW4A4Nvfp4MoEMethod.process_weights_after_loading
+
+            def _moe_pwal(self, layer: torch.nn.Module) -> None:
+                if getattr(self, "use_a16", False):
+                    if hasattr(layer, "w13_input_global_scale"):
+                        layer.w13_input_global_scale.data.fill_(1.0)
+                    if hasattr(layer, "w2_input_global_scale"):
+                        layer.w2_input_global_scale.data.fill_(1.0)
+                if (
+                    getattr(self.moe, "is_act_and_mul", False)
+                    and hasattr(layer, "w13_weight_global_scale")
+                    and layer.w13_weight_global_scale.shape[-1] == 2
+                ):
+                    g0 = layer.w13_weight_global_scale.data[:, 0].float()
+                    g1 = layer.w13_weight_global_scale.data[:, 1].float()
+                    if not torch.allclose(g0, g1):
+                        g_min = torch.minimum(g0, g1)
+                        ws = layer.w13_weight_scale.data
+                        n = ws.shape[1] // 2
+                        ws[:, :n, :] = (ws[:, :n, :].float() * (g_min / g0).view(-1, 1, 1)).to(ws.dtype)
+                        ws[:, n:, :] = (ws[:, n:, :].float() * (g_min / g1).view(-1, 1, 1)).to(ws.dtype)
+                        layer.w13_weight_global_scale.data[:, 0] = g_min.to(layer.w13_weight_global_scale.dtype)
+                        layer.w13_weight_global_scale.data[:, 1] = g_min.to(layer.w13_weight_global_scale.dtype)
+                return orig_moe_pwal(self, layer)
+
+            CompressedTensorsW4A4Nvfp4MoEMethod.process_weights_after_loading = _moe_pwal
+            CompressedTensorsW4A4Nvfp4MoEMethod._pb27_patched = True
+    except Exception as exc:
+        logger.warning("PB27 NVFP4 MoE scale hook skipped: %s", exc)
+
+
+_install_nvfp4_scale_hooks()
 
 
 # --------------------------------------------------------------------------
@@ -189,9 +237,13 @@ class PB27WindowedAttention(Qwen3NextAttention):
             prefix=f"{prefix}.o_proj",
         )
 
+        max_pos = max(
+            int(getattr(config, "max_position_embeddings", 262144) or 262144),
+            int(getattr(model_config, "max_model_len", 0) or 0) if model_config else 0,
+        )
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
-            max_position=config.max_position_embeddings,
+            max_position=max_pos,
             rope_parameters=config.rope_parameters,
             dual_chunk_attention_config=self.dual_chunk_attention_config,
         )
@@ -492,6 +544,9 @@ class PB27Model(Qwen3_5Model):
         super(Qwen3NextModel, self).__init__()
 
         config = vllm_config.model_config.hf_text_config
+        max_model_len = int(getattr(vllm_config.model_config, "max_model_len", 0) or 0)
+        if max_model_len > int(getattr(config, "max_position_embeddings", 0) or 0):
+            config.max_position_embeddings = max_model_len
         parallel_config = vllm_config.parallel_config
 
         eplb_config = parallel_config.eplb_config
@@ -612,6 +667,8 @@ class PB27ForConditionalGeneration(Qwen3_5ForConditionalGeneration):
     mamba state classmethods are inherited unchanged.
     """
 
+    language_model_cls = PB27ForCausalLM
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model"):
         nn.Module.__init__(self)
         config = vllm_config.model_config.hf_config
@@ -646,7 +703,7 @@ class PB27ForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             )
 
         with self._mark_language_model(vllm_config):
-            self.language_model = PB27ForCausalLM(
+            self.language_model = self.language_model_cls(
                 vllm_config=vllm_config, prefix=maybe_prefix(prefix, "language_model")
             )
 
@@ -657,3 +714,38 @@ class PB27ForConditionalGeneration(Qwen3_5ForConditionalGeneration):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+
+# --------------------------------------------------------------------------
+# Qwen3.5-MoE (qwen3_5_moe_text: PB27DecoderLayer already builds
+# Qwen3NextSparseMoeBlock; expert weights load through the inherited
+# Qwen3NextModel.load_weights expert mapping)
+# --------------------------------------------------------------------------
+
+
+class PB27MoeForCausalLM(PB27ForCausalLM, QwenNextMixtureOfExperts):
+    """Qwen3_5MoeForCausalLM (qwen3_5.py:457-462) on PB27ForCausalLM."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self.set_moe_parameters()
+
+
+@MULTIMODAL_REGISTRY.register_processor(
+    Qwen3VLMultiModalProcessor,
+    info=Qwen3_5MoeProcessingInfo,
+    dummy_inputs=Qwen3VLDummyInputsBuilder,
+)
+class PB27MoeForConditionalGeneration(
+    PB27ForConditionalGeneration, Qwen3_5_MoeMixtureOfExperts
+):
+    """Qwen3_5MoeForConditionalGeneration (qwen3_5.py:704-760) with
+    PB27MoeForCausalLM as the language model."""
+
+    # For MoE LoRA weights loading
+    is_3d_moe_weight = True
+    language_model_cls = PB27MoeForCausalLM
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model"):
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self.set_moe_parameters()

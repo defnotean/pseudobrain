@@ -1,0 +1,40 @@
+{
+ "n": 66,
+ "expected": 66,
+ "missing": 0,
+ "passed": 60,
+ "pass_rate": 0.9091,
+ "problems_solved_any": 31,
+ "problems": 33,
+ "by_tier": {
+  "easy": {
+   "passed": 16,
+   "n": 16,
+   "rate": 1.0
+  },
+  "fix": {
+   "passed": 4,
+   "n": 6,
+   "rate": 0.6667
+  },
+  "hard": {
+   "passed": 18,
+   "n": 20,
+   "rate": 0.9
+  },
+  "medium": {
+   "passed": 22,
+   "n": 24,
+   "rate": 0.9167
+  }
+ },
+ "no_code": 0,
+ "finish_length": 0,
+ "mean_completion_tokens": 1289,
+ "name": "pb27c_med",
+ "model": "pb27",
+ "reasoning_effort": "medium",
+ "temperature": 1.0,
+ "samples": 2,
+ "max_tokens": 32768
+}

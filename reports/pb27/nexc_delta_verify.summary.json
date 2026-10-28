@@ -1,0 +1,39 @@
+{
+ "name": "PseudoBrain-Nex-35B-A3B-NVFP4-Delta",
+ "model": "pb27",
+ "seed": 2710,
+ "lengths": {
+  "120000": {
+   "needle": 1.0,
+   "multi4": 1.0,
+   "trace4": 1.0,
+   "probes": {
+    "needle@0.1": 1.0,
+    "needle@0.5": 1.0,
+    "needle@0.9": 1.0,
+    "multi4": 1.0,
+    "trace4": 1.0
+   },
+   "max_prompt_tokens": 116711,
+   "mean_ttft_s": 52.1,
+   "mean_decode_tok_s": 5.5,
+   "errors": 0
+  },
+  "250000": {
+   "needle": 1.0,
+   "multi4": 1.0,
+   "trace4": 1.0,
+   "probes": {
+    "needle@0.1": 1.0,
+    "needle@0.5": 1.0,
+    "needle@0.9": 1.0,
+    "multi4": 1.0,
+    "trace4": 1.0
+   },
+   "max_prompt_tokens": 244065,
+   "mean_ttft_s": 111.0,
+   "mean_decode_tok_s": 3.48,
+   "errors": 0
+  }
+ }
+}

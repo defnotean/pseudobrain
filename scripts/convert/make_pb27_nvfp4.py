@@ -17,8 +17,10 @@ import json
 import os
 from pathlib import Path
 
-COPY = ("tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt", "chat_template.jinja",
-        "preprocessor_config.json", "video_preprocessor_config.json", "generation_config.json")
+COPY = ("tokenizer.json", "tokenizer_config.json", "tokenizer.model", "special_tokens_map.json",
+        "added_tokens.json", "vocab.json", "merges.txt", "chat_template.jinja",
+        "preprocessor_config.json", "processor_config.json", "video_preprocessor_config.json",
+        "generation_config.json")
 GDN_IGNORE = ["re:.*\\.gdn\\.(in_proj_qkv|in_proj_z|in_proj_a|in_proj_b|out_proj)$", "re:.*\\.gdn\\.conv1d$",
               "re:.*\\.gdn\\.norm$", "re:.*\\.gdn$"]
 
@@ -48,7 +50,10 @@ def main() -> None:
         link = out / f
         if link.is_symlink() or link.exists():
             link.unlink()
-        os.symlink(slim / f, link)
+        try:
+            os.link(slim / f, link)
+        except OSError:
+            os.symlink(slim / f, link)
     (out / "model.safetensors.index.json").write_text(json.dumps({"metadata": qidx.get("metadata", {}), "weight_map": weight_map}, indent=1))
 
     qcfg = json.loads((quant / "config.json").read_text())
@@ -58,9 +63,16 @@ def main() -> None:
     for k, v in scfg.items():
         if k.startswith("pb_"):
             cfg[k] = v
+            if isinstance(cfg.get("text_config"), dict):
+                cfg["text_config"][k] = v
     holder = cfg if "quantization_config" in cfg else cfg.get("text_config", {})
     qc = holder["quantization_config"]
     qc["ignore"] = list(qc.get("ignore", [])) + GDN_IGNORE
+    has_input_scale = any(k.endswith(".input_global_scale") for k in weight_map)
+    if not has_input_scale:
+        for grp in qc.get("config_groups", {}).values():
+            if isinstance(grp, dict) and grp.get("input_activations") is not None:
+                grp["input_activations"] = None
     (out / "config.json").write_text(json.dumps(cfg, indent=1))
     for name in COPY:
         src = slim / name

@@ -1,0 +1,39 @@
+{
+  "tasks": {
+    "squad": {
+      "items": 400,
+      "open_em": 0.1725,
+      "open_bpb": 0.6352200156130814,
+      "closed_em": 0.0,
+      "closed_bpb": 1.9980431281526956,
+      "seconds": 97.6
+    },
+    "facts": {
+      "items": 143,
+      "closed_em": 0.972027972027972,
+      "closed_bpb": 0.17064601534092785,
+      "open_em": 0.993006993006993,
+      "open_bpb": 0.08125629593010808,
+      "seconds": 7.4
+    }
+  },
+  "model": "core:/home/defnotean/x2/runs/pb27a/core.pt",
+  "name": "pb27a-squad",
+  "describe": {
+    "adapter": "hf",
+    "model_id": "core:/home/defnotean/x2/runs/pb27a/core.pt",
+    "name": "pb27a-squad",
+    "revision": null,
+    "dtype": "bfloat16",
+    "device": "cuda",
+    "parameters": 28750015488,
+    "max_length": 8192,
+    "bpb_window": 2048,
+    "vocab": 248320,
+    "prefix_token_id": 248046,
+    "transformers": null,
+    "torch": "2.14.0+cu130",
+    "memory_fraction": null
+  },
+  "quant": null
+}

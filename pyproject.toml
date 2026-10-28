@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pseudobrain"
+version = "1.0.0"
+description = "PseudoBrain: Constant-GPU-Memory Million-Token Inference via Parallel Gated DeltaNet Transplant and Unrotated Two-Hop Exact Memory Retrieval"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+authors = [
+  {name = "Ian Kurt Galeon", email = "iangaleonofficial@gmail.com"}
+]
+dependencies = [
+  "torch>=2.4.0",
+  "safetensors>=0.4.3",
+  "tokenizers>=0.19.0",
+  "transformers>=4.45.0",
+  "numpy>=1.26.0",
+]
+
+[project.optional-dependencies]
+train = [
+  "flash-linear-attention>=0.1.0",
+]
+serve = [
+  "vllm>=0.6.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pseudobrain*", "efficiency*", "learning*"]

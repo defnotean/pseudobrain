@@ -1,0 +1,15 @@
+{
+ "core": "core:/root/x2/runs/pb27a/core.pt",
+ "selector": "gateup",
+ "rank": 256,
+ "keep": 0.5,
+ "steps": 300,
+ "selector_params_m": 369.098752,
+ "dense_nll": 1.6383982508173793,
+ "pred_keep_0.5": 0.12643284034961888,
+ "oracle_keep_0.5": 0.011267037676949698,
+ "pred_keep_0.4": 0.18267863067515155,
+ "oracle_keep_0.4": 0.042391842945736835,
+ "pred_keep_0.35": 0.18480997609568162,
+ "oracle_keep_0.35": 0.051132220779437576
+}

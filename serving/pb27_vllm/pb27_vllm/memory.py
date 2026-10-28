@@ -14,25 +14,89 @@ Enable with PB27_MEMORY="blocks,block_size,decode_blocks,neighbors,rerank" (e.g.
 from __future__ import annotations
 
 import logging
+import mmap
 import os
+import tempfile
 from dataclasses import dataclass, field
 
 import torch
 import torch.nn.functional as F
 
+try:
+    from vllm.vllm_flash_attn import _vllm_fa2_C  # noqa: F401
+    HAS_FA2 = hasattr(torch.ops, "_vllm_fa2_C") and hasattr(torch.ops._vllm_fa2_C, "varlen_fwd")
+except Exception:
+    HAS_FA2 = False
+
 log = logging.getLogger("vllm")
 
-MEMORY: dict = {"enabled": False, "blocks": 64, "block_size": 64, "decode_blocks": 0, "neighbors": 0, "rerank": 0,
+MEMORY: dict = {"enabled": True, "blocks": 256, "block_size": 64, "decode_blocks": 256, "neighbors": 0, "rerank": 512,
                 "chunk": 64, "window": int(os.environ.get("PB27_WINDOW", "16384"))}
 DEBUG = os.environ.get("PB27_MEMORY_DEBUG", "") == "1"
-BATCH: dict = {"ib": None}                       # the runner's current InputBatch (req_ids, query_start_loc, ...)
+NORETRIEVE = os.environ.get("PB27_MEMORY_NORETRIEVE", "") == "1"   # diagnostic: recompute pieces from the archive without retrieval
+SINKS = int(os.environ.get("PB27_MEMORY_SINKS", "4") or 0)         # PB-27 was trained with 4 always-visible sink positions; vLLM
+                                                                   # drops them, the recomputed pieces restore positions 0..SINKS-1
+PREFILL = os.environ.get("PB27_MEMORY_PREFILL", "pt")             # prefill retrieval: "1" every piece, "0" none, "last"
+                                                                   # or "lastN" only the final N pieces, "pt" final question piece
+TAIL = int(PREFILL[4:] or 1) if PREFILL.startswith("last") else 1
+PT_CHUNK = int(os.environ.get("PB27_MEMORY_PT_CHUNK", "2048") or 2048)  # prefill chunk size of the PyTorch tier
+PREFILL_BLOCKS = int(os.environ.get("PB27_MEMORY_PREFILL_BLOCKS", "0") or 0)  # block budget for prefill pieces (0 = as decode)
+ORACLE = os.environ.get("PB27_MEMORY_ORACLE", "") == "1"         # diagnostic: select blocks by exact attention mass
+FAITHFUL = os.environ.get("PB27_MEMORY_FAITHFUL", "1") != "0"    # mirror efficiency/exact_memory.py: archive starts
+ORIGIN = SINKS if FAITHFUL else 0                                  # after the sinks (blocks at 4+64j) and keeps tail
+QWIN = os.environ.get("PB27_MEMORY_QWIN", "") == "1"             # decode retrieval uses trailing verified query window
+DSTEP = os.environ.get("PB27_MEMORY_DSTEP", "") == "1"           # step-1 decode uses `blocks`; step-2+ decode uses `decode_blocks`
+SCALE = [int(x) for x in os.environ.get("PB27_MEMORY_SCALE", "2048:384:4096:512:8192:1536").split(":") if x.strip()]
+OFFLOAD = os.environ.get("PB27_MEMORY_OFFLOAD", "nvme").strip().lower()  # "", "cpu", "fp8", "cpu_fp8", or "nvme"
+# "nvme": fp8/bf16 K/V live in an unlinked sparse file mapped into memory (page cache is evictable, so resident memory
+# stays flat while disk holds the history); block bounds stay resident. NVME_CAP is the max tokens per request.
+NVME_DIR = os.environ.get("PB27_MEMORY_NVME_DIR", "") or None
+NVME_CAP = int(os.environ.get("PB27_MEMORY_NVME_CAP", "1114112") or 1114112)
+# "bf16" keeps the file-backed archive in the model dtype (2x disk/page cache, no e4m3 rounding of the recomputed
+# window and retrieved blocks); "fp8" is the original e4m3 archive.
+NVME_DTYPE = os.environ.get("PB27_MEMORY_NVME_DTYPE", "bf16").strip().lower()
+# Per-query retrieval for multi-token decode pieces (speculative verify): each query scores blocks over its own G
+# heads and attends to its own top-k, as non-speculative decode would, instead of one block set shared by the
+# verified token and every draft. PERTOKEN_CAND scales the rerank candidate pool; PERTOKEN_UNION caps the gathered
+# union at UNION x k blocks.
+PERTOKEN = os.environ.get("PB27_MEMORY_PERTOKEN", "1") != "0"
+PERTOKEN_CAND = int(os.environ.get("PB27_MEMORY_PERTOKEN_CAND", "4") or 4)
+PERTOKEN_UNION = int(os.environ.get("PB27_MEMORY_PERTOKEN_UNION", "2") or 2)
+# LEAD: the query whose output is always emitted (the verified token of a verify piece, the last query of the final
+# prefill piece) keeps its full own top-k from its own rerank pool; the other queries fill the remaining union slots.
+# OPEN: every query of the piece attends to the whole union instead of only its own blocks (same cost as the masked
+# form; a query never sees fewer blocks than the lead's top-k). PREFILL_UNION > 0: the final prefill piece also
+# retrieves per query, with the union capped at PREFILL_UNION x k (once per request and layer).
+PERTOKEN_LEAD = os.environ.get("PB27_MEMORY_PERTOKEN_LEAD", "1") != "0"
+PERTOKEN_OPEN = os.environ.get("PB27_MEMORY_PERTOKEN_OPEN", "1") != "0"
+PERTOKEN_PREFILL_UNION = int(os.environ.get("PB27_MEMORY_PERTOKEN_PREFILL_UNION", "2") or 2)
+DECODE_STRIDE = int(os.environ.get("PB27_MEMORY_DECODE_STRIDE", "4") or 4)
+LAYER_STRIDE = int(os.environ.get("PB27_MEMORY_LAYER_STRIDE", "1") or 1)
+GPU_ARC_CAP = int(os.environ.get("PB27_MEMORY_GPU_ARC_CAP", "262144") or 262144)
+QBUF_CAP = 256
+GPU_WIN_CAP = 32768
+LSE = os.environ.get("PB27_MEMORY_LSE", "1") != "0"               # FlashAttention-2 LSE-merge fast path for piece_attention
+RERANK_ALL = os.environ.get("PB27_MEMORY_RERANK_ALL", "1") != "0"  # exact rescoring for every piece, not only decode
+BATCH: dict = {"ib": None, "pos_list": None}     # the runner's current InputBatch (req_ids, query_start_loc, ...)
+PROMPT_LENS: dict[str, int] = {}                 # req_id -> initial prompt_len from RequestState.add_request
 ARCHIVES: dict[tuple[str, str], "Archive"] = {}  # (req_id, layer_name) -> Archive
-STATS: dict = {"calls": 0, "fallback": 0, "retrievals": 0, "pieces": 0, "tokens_archived": 0}
+STATS: dict = {"calls": 0, "fallback": 0, "retrievals": 0, "pieces": 0, "tokens_archived": 0,
+               "adopt_full": 0, "adopt_partial": 0, "adopt_none": 0, "hole_skips": 0,
+               "pertoken": 0, "pertoken_capped": 0}
+# Prefix caching: vLLM skips computing the cached prefix of a new request, so the archive of the request that
+# produced that prefix is retained after it finishes and adopted by the next request whose tokens match it.
+RETAIN = int(os.environ.get("PB27_MEMORY_RETAIN", "0") or 0)   # max retired archive sets kept (0 = off)
+RETIRED: list[dict] = []        # [{"tokens": int32 tensor of the finished request, "archives": {layer: Archive}}]
+ADOPTED: dict[str, tuple] = {}  # req_id -> (archives by layer, hole_lo, hole_hi, num_computed)
 
 
 def configure_from_env() -> None:
     spec = os.environ.get("PB27_MEMORY", "").strip()
+    if spec.lower() in ("0", "off", "false", "none"):
+        MEMORY["enabled"] = False
+        return
     if not spec:
+        MEMORY["enabled"] = MEMORY["blocks"] > 0
         return
     parts = [int(x) for x in spec.split(",")]
     for key, val in zip(["blocks", "block_size", "decode_blocks", "neighbors", "rerank"], parts):
@@ -46,69 +110,327 @@ class Archive:
     values: torch.Tensor
     kmax: torch.Tensor          # [KV, cap // block, D]
     kmin: torch.Tensor
+    qbuf: torch.Tensor | None = None  # [QBUF_CAP, H, D] rolling query buffer indexed by position % QBUF_CAP
     size: int = 0               # 1 + highest position written
+    prompt_len: int = 0         # 1 + highest prefill position written
     dirty_lo: int = field(default=1 << 60)  # block range whose bounds need refreshing
     dirty_hi: int = -1
+    hole_lo: int = 0            # positions [hole_lo, hole_hi) were served from vLLM's prefix cache but are not in
+    hole_hi: int = 0            # this archive (no matching retained archive); they are never read
+    mapped: bool = False        # K/V are file-backed (OFFLOAD=nvme) at fixed capacity
+    gpu_k: torch.Tensor | None = None    # [GPU_WIN_CAP, KV, D] resident tail on GPU when keys live on CPU/NVMe
+    gpu_v: torch.Tensor | None = None
+    gpu_lo: int = 0
+    gpu_hi: int = 0
+    sink_k: torch.Tensor | None = None   # [SINKS, KV, D] resident sinks on GPU when keys live on CPU/NVMe
+    sink_v: torch.Tensor | None = None
+    last_top: torch.Tensor | None = None
+    last_rk: torch.Tensor | None = None
+    prompt_top: torch.Tensor | None = None  # [KV, U] priority-ordered blocks from final prefill question piece
+    decode_top: torch.Tensor | None = None  # [KV, U] rolling priority-ordered blocks accumulated during decode
+    decode_step: int = 0                    # per-layer decode token counter
+    last_hop_head: torch.Tensor | None = None  # [KV, 8] previous first-hop decode seeds for 2-hop change detection
+    cached_top: torch.Tensor | None = None  # [KV, k] active retrieved block indices cached on GPU
+    cached_rk: torch.Tensor | None = None   # [KV, k*B, D] cached retrieved keys on GPU
+    cached_rv: torch.Tensor | None = None   # [KV, k*B, D] cached retrieved values on GPU
+    cached_ns: int = -1                     # cached sink count in cached_pre_k / cached_pre_v
+    cached_pre_k: torch.Tensor | None = None  # [ns + k*B, KV, D] FA2-ready pre_k cached on GPU
+    cached_pre_v: torch.Tensor | None = None  # [ns + k*B, KV, D] FA2-ready pre_v cached on GPU
+    cached_cu: tuple | None = None          # (t, w_len, p_len, cu_q, cu_w, cu_p) cached int32 cu_seqlens on GPU
 
     @staticmethod
-    def new(kv: int, d: int, cap: int, block: int, dtype, device) -> "Archive":
-        return Archive(torch.empty(kv, cap, d, dtype=dtype, device=device), torch.empty(kv, cap, d, dtype=dtype, device=device),
-                       torch.empty(kv, cap // block, d, dtype=torch.float32, device=device),
-                       torch.empty(kv, cap // block, d, dtype=torch.float32, device=device))
+    def new(kv: int, d: int, cap: int, block: int, dtype, device, max_hint: int = 0) -> "Archive":
+        bounds = (torch.empty(kv, cap // block, d, dtype=torch.float32, device=device),
+                  torch.empty(kv, cap // block, d, dtype=torch.float32, device=device))
+        gpu_cap = GPU_ARC_CAP if kv <= 2 else min(GPU_ARC_CAP, 65536)
+        if OFFLOAD == "nvme" and (max_hint <= 0 or max_hint > gpu_cap or cap > gpu_cap):
+            big = max(cap, -(-NVME_CAP // block) * block)
+            arc_dtype = torch.float8_e4m3fn if NVME_DTYPE == "fp8" else dtype
+            return Archive(_mapped(kv, big, d, arc_dtype), _mapped(kv, big, d, arc_dtype), *bounds, mapped=True)
+        if OFFLOAD == "nvme":
+            cap = min(max(cap, -(-max_hint // block) * block), gpu_cap)
+            bounds = (torch.empty(kv, cap // block, d, dtype=torch.float32, device=device),
+                      torch.empty(kv, cap // block, d, dtype=torch.float32, device=device))
+            return Archive(torch.empty(kv, cap, d, dtype=dtype, device=device),
+                           torch.empty(kv, cap, d, dtype=dtype, device=device), *bounds, mapped=False)
+        kv_dev = torch.device("cpu") if "cpu" in OFFLOAD else device
+        kv_dtype = torch.float8_e4m3fn if "fp8" in OFFLOAD else dtype
+        return Archive(torch.empty(kv, cap, d, dtype=kv_dtype, device=kv_dev),
+                       torch.empty(kv, cap, d, dtype=kv_dtype, device=kv_dev), *bounds)
 
     def grow(self, need: int, block: int) -> None:
-        cap = self.keys.shape[1]
+        cap = self.kmax.shape[1] * block if self.mapped else self.keys.shape[1]
         if need <= cap:
             return
         new_cap = cap
         while new_cap < need:
             new_cap *= 2
         kv, d = self.keys.shape[0], self.keys.shape[2]
-        for name in ("keys", "values"):
-            old = getattr(self, name)
-            buf = torch.empty(kv, new_cap, d, dtype=old.dtype, device=old.device)
-            buf[:, :cap] = old
-            setattr(self, name, buf)
+        gpu_cap = GPU_ARC_CAP if kv <= 2 else min(GPU_ARC_CAP, 65536)
+        if OFFLOAD == "nvme" and not self.mapped and need > gpu_cap:
+            big = max(new_cap, -(-NVME_CAP // block) * block)
+            arc_dtype = torch.float8_e4m3fn if NVME_DTYPE == "fp8" else self.keys.dtype
+            mk, mv = _mapped(kv, big, d, arc_dtype), _mapped(kv, big, d, arc_dtype)
+            if self.size > 0:
+                mk[:, :self.size] = self.keys[:, :self.size].to(device=mk.device, dtype=arc_dtype)
+                mv[:, :self.size] = self.values[:, :self.size].to(device=mv.device, dtype=arc_dtype)
+                if SINKS > 0:
+                    s_end = min(self.size, SINKS)
+                    self.sink_k = self.keys[:, :s_end].transpose(0, 1).contiguous()
+                    self.sink_v = self.values[:, :s_end].transpose(0, 1).contiguous()
+            self.keys, self.values, self.mapped = mk, mv, True
+            new_cap = min(new_cap, self.keys.shape[1] // block * block)
+        elif self.mapped:
+            if need > self.keys.shape[1]:
+                raise RuntimeError(f"PB27 nvme archive full: need {need} > PB27_MEMORY_NVME_CAP {self.keys.shape[1]}")
+            new_cap = min(new_cap, self.keys.shape[1] // block * block)
+        else:
+            if OFFLOAD == "nvme":
+                new_cap = min(new_cap, gpu_cap)
+            for name in ("keys", "values"):
+                old = getattr(self, name)
+                buf = torch.empty(kv, new_cap, d, dtype=old.dtype, device=old.device)
+                buf[:, :cap] = old
+                setattr(self, name, buf)
         for name in ("kmax", "kmin"):
             old = getattr(self, name)
             buf = torch.empty(kv, new_cap // block, d, dtype=old.dtype, device=old.device)
             buf[:, : cap // block] = old
             setattr(self, name, buf)
 
-    def write(self, pos: torch.Tensor, k: torch.Tensor, v: torch.Tensor, block: int) -> None:
+    def write(self, pos: torch.Tensor, k: torch.Tensor, v: torch.Tensor, block: int,
+              p0: int | None = None, hi: int | None = None) -> None:
         """pos [N] long, k/v [N, KV, D] -> store at those positions (overwriting re-verified speculative slots)."""
-        hi = int(pos.max()) + 1
+        if p0 is None or hi is None:
+            hi = int(pos.max()) + 1
+            p0 = int(pos.min())
+        n = int(pos.numel())
+        contig = (hi - p0 == n)
         self.grow(hi, block)
-        self.keys[:, pos] = k.transpose(0, 1).to(self.keys.dtype)
-        self.values[:, pos] = v.transpose(0, 1).to(self.values.dtype)
+        kt = k.transpose(0, 1)
+        vt = v.transpose(0, 1)
+        if self.keys.device != k.device and self.keys.dtype != torch.float8_e4m3fn:
+            if SINKS > 0 and p0 < SINKS and contig:
+                s_end = min(hi, SINKS)
+                if self.sink_k is None:
+                    self.sink_k = torch.empty(SINKS, k.shape[1], k.shape[2], dtype=k.dtype, device=k.device)
+                    self.sink_v = torch.empty(SINKS, v.shape[1], v.shape[2], dtype=v.dtype, device=k.device)
+                self.sink_k[p0:s_end] = k[:s_end - p0]
+                self.sink_v[p0:s_end] = v[:s_end - p0]
+            if contig and n <= GPU_WIN_CAP and (self.gpu_k is None or (p0 >= self.gpu_lo and p0 <= self.gpu_hi)):
+                if self.gpu_k is None:
+                    self.gpu_k = torch.empty(GPU_WIN_CAP, k.shape[1], k.shape[2], dtype=k.dtype, device=k.device)
+                    self.gpu_v = torch.empty(GPU_WIN_CAP, v.shape[1], v.shape[2], dtype=v.dtype, device=k.device)
+                    self.gpu_lo = p0
+                elif hi - self.gpu_lo > GPU_WIN_CAP:
+                    keep_lo = max(self.gpu_lo, p0 - MEMORY["window"] - block)
+                    keep_n = p0 - keep_lo
+                    if keep_n > 0:
+                        self.gpu_k[:keep_n] = self.gpu_k[keep_lo - self.gpu_lo : p0 - self.gpu_lo].clone()
+                        self.gpu_v[:keep_n] = self.gpu_v[keep_lo - self.gpu_lo : p0 - self.gpu_lo].clone()
+                    self.gpu_lo = keep_lo
+                self.gpu_k[p0 - self.gpu_lo : hi - self.gpu_lo] = k
+                self.gpu_v[p0 - self.gpu_lo : hi - self.gpu_lo] = v
+                self.gpu_hi = hi
+            else:
+                self.gpu_k = self.gpu_v = None
+        fast_bounds = False
+        b_start = b_end = 0
+        if hi - 1 >= ORIGIN and contig and n >= block:
+            b_start = max(0, (p0 - ORIGIN + block - 1) // block)
+            b_end = max(b_start, (hi - ORIGIN) // block)
+            if b_end > b_start:
+                s0 = ORIGIN + b_start * block - p0
+                s1 = ORIGIN + b_end * block - p0
+                k_full = kt[:, s0:s1].float().view(kt.shape[0], b_end - b_start, block, kt.shape[2])
+                self.kmax[:, b_start:b_end] = k_full.amax(2)
+                self.kmin[:, b_start:b_end] = k_full.amin(2)
+                fast_bounds = True
+        if contig:
+            self.keys[:, p0:hi] = kt if (self.keys.device == kt.device and self.keys.dtype == kt.dtype) else kt.to(device=self.keys.device, dtype=self.keys.dtype)
+            self.values[:, p0:hi] = vt if (self.values.device == vt.device and self.values.dtype == vt.dtype) else vt.to(device=self.values.device, dtype=self.values.dtype)
+        else:
+            p_idx = pos if self.keys.device == pos.device else pos.to(self.keys.device)
+            self.keys[:, p_idx] = kt.to(device=self.keys.device, dtype=self.keys.dtype)
+            self.values[:, p_idx] = vt.to(device=self.values.device, dtype=self.values.dtype)
         self.size = max(self.size, hi)
-        lo_b, hi_b = int(pos.min()) // block, (hi - 1) // block
-        self.dirty_lo, self.dirty_hi = min(self.dirty_lo, lo_b), max(self.dirty_hi, hi_b)
-        STATS["tokens_archived"] += int(pos.numel())
-
-    def refresh_bounds(self, block: int) -> None:
-        if self.dirty_hi < self.dirty_lo:
+        if hi - 1 < ORIGIN:
             return
-        lo, hi = self.dirty_lo * block, min(self.size, (self.dirty_hi + 1) * block)
-        seg = self.keys[:, lo:hi].float()
+        lo_b, hi_b = max(0, p0 - ORIGIN) // block, (hi - 1 - ORIGIN) // block
+        if fast_bounds:
+            if lo_b < b_start:
+                self._refresh_range(lo_b, b_start - 1, block)
+            if hi_b >= b_end:
+                self._refresh_range(b_end, hi_b, block)
+            STATS["tokens_archived"] += n
+            return
+        self.dirty_lo, self.dirty_hi = min(self.dirty_lo, lo_b), max(self.dirty_hi, hi_b)
+        STATS["tokens_archived"] += n
+
+    def write_q(self, pos: torch.Tensor, q: torch.Tensor) -> None:
+        """pos [N] long, q [N, H, D] -> store trailing queries in ring buffer by position."""
+        if self.qbuf is None:
+            self.qbuf = torch.zeros(QBUF_CAP, q.shape[1], q.shape[2], dtype=q.dtype, device=q.device)
+        if pos.numel() > QBUF_CAP:
+            pos, q = pos[-QBUF_CAP:], q[-QBUF_CAP:]
+        self.qbuf[pos % QBUF_CAP] = q.to(self.qbuf.dtype)
+
+    def _refresh_range(self, lo_b: int, hi_b: int, block: int) -> None:
+        if hi_b < lo_b:
+            return
+        lo, hi = ORIGIN + lo_b * block, min(self.size, ORIGIN + (hi_b + 1) * block)
+        if hi <= lo:
+            return
+        if self.gpu_k is not None and lo >= self.gpu_lo and hi <= self.gpu_hi:
+            seg = self.gpu_k[lo - self.gpu_lo : hi - self.gpu_lo].transpose(0, 1).float()
+        else:
+            seg = self.keys[:, lo:hi].to(device=self.kmax.device).float()
         pad = (-seg.shape[1]) % block
         if pad:
             seg = torch.cat((seg, seg[:, -1:].expand(-1, pad, -1)), dim=1)
         blocks = seg.view(seg.shape[0], -1, block, seg.shape[2])
-        self.kmax[:, self.dirty_lo: self.dirty_lo + blocks.shape[1]] = blocks.amax(2)
-        self.kmin[:, self.dirty_lo: self.dirty_lo + blocks.shape[1]] = blocks.amin(2)
+        self.kmax[:, lo_b: lo_b + blocks.shape[1]] = blocks.amax(2)
+        self.kmin[:, lo_b: lo_b + blocks.shape[1]] = blocks.amin(2)
+
+    def refresh_bounds(self, block: int) -> None:
+        if self.dirty_hi < self.dirty_lo:
+            return
+        self._refresh_range(self.dirty_lo, self.dirty_hi, block)
         self.dirty_lo, self.dirty_hi = 1 << 60, -1
 
 
-def drop_request(req_id: str) -> None:
-    for key in [k for k in ARCHIVES if k[0] == req_id]:
-        del ARCHIVES[key]
+def _mapped(kv: int, cap: int, d: int, dtype) -> torch.Tensor:
+    """[kv, cap, d] tensor backed by an unlinked sparse file; only touched pages use disk or memory."""
+    nbytes = kv * cap * d * torch.empty(0, dtype=dtype).element_size()
+    fd, path = tempfile.mkstemp(dir=NVME_DIR, prefix="pb27_arc_")
+    try:
+        os.unlink(path)
+        os.ftruncate(fd, nbytes)
+        mm = mmap.mmap(fd, nbytes)
+    finally:
+        os.close(fd)
+    return torch.frombuffer(mm, dtype=torch.uint8).view(dtype).view(kv, cap, d)
 
 
-def retrieve_blocks(arc: Archive, q: torch.Tensor, groups: int, limit: int, rerank: bool) -> torch.Tensor | None:
+def _free(archives) -> None:
+    archives.clear()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def drop_request(req_id: str, tokens: torch.Tensor | None = None) -> None:
+    """A request finished. With RETAIN > 0 and its token ids known, keep its archives for prefix reuse."""
+    PROMPT_LENS.pop(req_id, None)
+    ADOPTED.pop(req_id, None)
+    keys = [k for k in ARCHIVES if k[0] == req_id]
+    archives = {k[1]: ARCHIVES.pop(k) for k in keys}
+    if not archives:
+        return
+    if RETAIN <= 0 or tokens is None or len(tokens) < 2 or any(a.hole_hi > a.hole_lo for a in archives.values()):
+        _free(archives)
+        return
+    RETIRED.append({"tokens": tokens, "archives": archives})
+    while len(RETIRED) > RETAIN:
+        _free(RETIRED.pop(0)["archives"])
+
+
+def adopt_for_request(req_id: str, all_token_ids, num_computed: int) -> None:
+    """New request whose first `num_computed` tokens come from vLLM's prefix cache: adopt the retired archive set
+    with the longest exact token match. Positions not covered by it become a hole that is never read."""
+    if num_computed <= 0 or not MEMORY["enabled"]:
+        return
+    new = torch.as_tensor(list(all_token_ids[:num_computed]), dtype=torch.int32)
+    best, best_len = None, 0
+    for i, ent in enumerate(RETIRED):
+        old = ent["tokens"]
+        n = min(len(old) - 1, num_computed)      # the last sampled token of a finished request was never computed
+        if n <= best_len:
+            continue
+        neq = (old[:n].cpu() != new[:n]).nonzero()
+        lcp = int(neq[0]) if len(neq) else n
+        if lcp > best_len:
+            best, best_len = i, lcp
+    if best is None:
+        STATS["adopt_none"] += 1
+        ADOPTED[req_id] = ({}, 0, num_computed, num_computed)
+        return
+    ent = RETIRED.pop(best)
+    hole = (best_len, num_computed) if best_len < num_computed else (0, 0)
+    STATS["adopt_full" if hole == (0, 0) else "adopt_partial"] += 1
+    ADOPTED[req_id] = (ent["archives"], *hole, num_computed)
+
+
+def oracle_block_mass(arc: Archive, qg: torch.Tensor, full: int, block: int, qchunk: int = 256) -> torch.Tensor:
+    """Diagnostic selector: the true softmax attention mass of each archived block, normalised over the archived
+    blocks per query and summed over the piece's queries. qg [KV, G*T, D] -> [KV, full]. Small per-head chunks keep
+    the extra allocation to tens of MB (GB10 memory is shared with the host)."""
+    kv, n, d = qg.shape
+    mass = torch.zeros(kv, full, device=qg.device)
+    for g in range(kv):
+        keys = arc.keys[g, ORIGIN:ORIGIN + full * block]                                             # [N, D]
+        for c0 in range(0, n, qchunk):
+            logits = (qg[g, c0:c0 + qchunk].to(keys.dtype) @ keys.T).float() * d ** -0.5  # [q, N]
+            mass[g] += logits.softmax(-1).view(-1, full, block).sum((0, 2))
+    return mass
+
+
+def _gather_tokens(t: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+    if t.dtype == torch.float8_e4m3fn:
+        return t[torch.arange(t.shape[0], device=t.device)[:, None], idx]
+    return t.gather(1, idx.unsqueeze(-1).expand(-1, -1, t.shape[2]))
+
+
+def _gather_blocks(t: torch.Tensor, blk_idx: torch.Tensor, block: int) -> torch.Tensor:
+    """Gather contiguous blocks `blk_idx` [KV, B] starting at ORIGIN from `t` [KV, cap, D] -> [KV, B * block, D]."""
+    kv, cap, d = t.shape
+    b_idx = blk_idx.to(t.device)
+    n_blk = (cap - ORIGIN) // block
+    tb = t[:, ORIGIN:ORIGIN + n_blk * block].view(kv, n_blk, block * d)
+    if not t.is_cuda or t.dtype == torch.float8_e4m3fn:
+        return tb[torch.arange(kv, device=t.device)[:, None], b_idx].view(kv, -1, d)
+    return tb.gather(1, b_idx.unsqueeze(-1).expand(-1, -1, block * d)).view(kv, -1, d)
+
+
+def _gather_cached_delta(arc: Archive, top: torch.Tensor, block: int, dtype, device) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reuse blocks already resident in `arc.cached_rk`/`arc.cached_rv` on GPU and gather only `top \\ arc.cached_top`."""
+    if (arc.cached_top is not None and arc.cached_rk is not None and arc.cached_rv is not None
+            and arc.cached_top.shape == top.shape and (top is arc.cached_top or torch.equal(top, arc.cached_top))):
+        return arc.cached_rk.to(dtype=dtype), arc.cached_rv.to(dtype=dtype)
+    if (arc.keys.is_cuda and arc.keys.dtype != torch.float8_e4m3fn
+            or arc.cached_top is None or arc.cached_rk is None or arc.cached_rv is None
+            or arc.cached_top.shape != top.shape):
+        rk = _gather_blocks(arc.keys, top, block).to(device=device, dtype=dtype)
+        rv = _gather_blocks(arc.values, top, block).to(device=device, dtype=dtype)
+        return rk, rv
+    kv, k_len = top.shape
+    d = arc.keys.shape[2]
+    pos_in_cache = torch.searchsorted(arc.cached_top, top)
+    pos_clamped = pos_in_cache.clamp(max=k_len - 1)
+    hit = (pos_in_cache < k_len) & (arc.cached_top.gather(1, pos_clamped) == top)
+    idx_exp = pos_clamped.unsqueeze(-1).expand(kv, k_len, block * d)
+    rk = arc.cached_rk.view(kv, k_len, block * d).gather(1, idx_exp).view(kv, k_len, block, d).to(dtype=dtype)
+    rv = arc.cached_rv.view(kv, k_len, block * d).gather(1, idx_exp).view(kv, k_len, block, d).to(dtype=dtype)
+    hit_cpu = hit.cpu()
+    if not bool(hit_cpu.all()):
+        top_cpu = top.to(arc.keys.device)
+        n_blk = (arc.keys.shape[1] - ORIGIN) // block
+        kb_all = arc.keys[:, ORIGIN:ORIGIN + n_blk * block].view(kv, n_blk, block, d)
+        vb_all = arc.values[:, ORIGIN:ORIGIN + n_blk * block].view(kv, n_blk, block, d)
+        for g in range(kv):
+            miss_cpu = (~hit_cpu[g]).nonzero(as_tuple=True)[0]
+            if miss_cpu.numel() > 0:
+                miss_blks = top_cpu[g, miss_cpu]
+                miss_gpu = miss_cpu.to(device=device)
+                rk[g, miss_gpu] = kb_all[g, miss_blks].to(device=device, dtype=dtype)
+                rv[g, miss_gpu] = vb_all[g, miss_blks].to(device=device, dtype=dtype)
+    return rk.view(kv, k_len * block, d), rv.view(kv, k_len * block, d)
+
+
+def retrieve_blocks(arc: Archive, q: torch.Tensor, groups: int, limit: int, rerank: bool,
+                    budget: int = 0) -> torch.Tensor | None:
     """Indices of the top blocks among archived positions [0, limit) for query piece q [T, H, D] -> [KV, k] or None."""
     block = MEMORY["block_size"]
-    full = limit // block
+    full = (limit - ORIGIN) // block
     if full <= 0:
         return None
     arc.refresh_bounds(block)
@@ -116,16 +438,50 @@ def retrieve_blocks(arc: Archive, q: torch.Tensor, groups: int, limit: int, rera
     kv = h // groups
     qg = q.float().permute(1, 0, 2).reshape(kv, groups * t, d)                         # [KV, G*T, D]
     pos, neg = qg.clamp(min=0), qg.clamp(max=0)
-    score = (pos @ arc.kmax[:, :full].transpose(-1, -2) + neg @ arc.kmin[:, :full].transpose(-1, -2)).amax(1)
-    budget = MEMORY["decode_blocks"] if (rerank and MEMORY["decode_blocks"]) else MEMORY["blocks"]
-    k = min(budget, full)
-    if rerank and MEMORY["rerank"] > k:
-        c = min(MEMORY["rerank"], full)
+    if ORACLE:
+        score = oracle_block_mass(arc, qg, full, block)
+    else:
+        kmax_t, kmin_t = arc.kmax[:, :full].transpose(-1, -2), arc.kmin[:, :full].transpose(-1, -2)
+        if pos.shape[1] <= 256:
+            score = (pos @ kmax_t + neg @ kmin_t).amax(1)
+        else:
+            score = torch.full((kv, full), float("-inf"), device=q.device)
+            for c0 in range(0, pos.shape[1], 256):
+                s_c = (pos[:, c0:c0 + 256] @ kmax_t + neg[:, c0:c0 + 256] @ kmin_t).amax(1)
+                score = torch.maximum(score, s_c)
+    n_valid = full
+    if arc.hole_hi > arc.hole_lo:
+        b0 = max(0, arc.hole_lo - ORIGIN) // block
+        b1 = min(full, (arc.hole_hi - ORIGIN + block - 1) // block)
+        if b1 > b0:
+            score[:, b0:b1] = float("-inf")
+            n_valid = full - (b1 - b0)
+        if n_valid <= 0:
+            return None
+    if not budget:
+        budget = MEMORY["decode_blocks"] if (rerank and MEMORY["decode_blocks"]) else MEMORY["blocks"]
+    n_arch = max(full, (arc.prompt_len - MEMORY["window"] - ORIGIN) // block)
+    for s_thresh, s_blocks in zip(SCALE[0::2], SCALE[1::2]):
+        if n_arch > s_thresh:
+            budget = max(budget, s_blocks)
+    k = min(budget, n_valid)
+    rerank_pool = max(MEMORY["rerank"], 2 * budget) if MEMORY["rerank"] > 0 else 0
+    arc.last_top = arc.last_rk = None
+    if rerank and rerank_pool > k and not ORACLE:
+        c = min(rerank_pool, n_valid)
         cand = score.topk(c, dim=-1).indices                                              # [KV, c]
-        idx = (cand.unsqueeze(-1) * block + torch.arange(block, device=q.device)).view(kv, -1)
-        ck = arc.keys.gather(1, idx.unsqueeze(-1).expand(-1, -1, d)).float()
+        ck_raw = _gather_blocks(arc.keys, cand, block).to(device=q.device)
+        ck = ck_raw.float()
         exact = torch.einsum("gqd,gnd->gqn", qg, ck).amax(1).view(kv, c, block).amax(-1)
-        top = cand.gather(-1, exact.topk(k, dim=-1).indices)
+        keep = exact.topk(k, dim=-1).indices
+        top = cand.gather(-1, keep)
+        if not MEMORY["neighbors"]:
+            order = top.argsort(-1)
+            top, keep = top.gather(-1, order), keep.gather(-1, order)
+            arc.last_top = top
+            arc.last_rk = ck_raw.view(kv, c, block * d).gather(1, keep.unsqueeze(-1).expand(-1, -1, block * d)).view(kv, -1, d)
+            STATS["retrievals"] += 1
+            return top
     else:
         top = score.topk(k, dim=-1).indices
     if MEMORY["neighbors"]:
@@ -134,32 +490,416 @@ def retrieve_blocks(arc: Archive, q: torch.Tensor, groups: int, limit: int, rera
     return top.sort(-1).values
 
 
+def _ranks(score: torch.Tensor) -> torch.Tensor:
+    """Rank (0 = best) of every entry along the last axis."""
+    order = score.argsort(-1, descending=True)
+    ar = torch.arange(score.shape[-1], device=score.device).expand_as(order)
+    return torch.empty_like(order).scatter_(-1, order, ar)
+
+
+def _dedup_priority(seq: torch.Tensor, u: int) -> torch.Tensor:
+    """Select the first `u` unique block indices per row of `seq` [KV, M] in priority order -> [KV, u_eff]."""
+    kv, m = seq.shape
+    u_eff = min(u, m)
+    vals, perm = seq.sort(dim=-1, stable=True)
+    dup = torch.zeros_like(vals, dtype=torch.bool)
+    dup[:, 1:] = vals[:, 1:] == vals[:, :-1]
+    score = torch.where(dup, perm + m, perm)
+    keep = score.topk(u_eff, dim=-1, largest=False).values % m
+    return seq.gather(-1, keep)
+
+
+def _expand_successors_dedup(blk_ord: torch.Tensor, full: int, u: int,
+                             m_succ: int = 80) -> tuple[torch.Tensor, torch.Tensor]:
+    """Interleave each of the first `m_succ` blocks in `blk_ord` [KV, M] with its successor `(b + 1).clamp(max=full - 1)`
+    and select the first `u` unique blocks per row in priority order -> (top_prio [KV, u], top_sorted [KV, u])."""
+    kv, m = blk_ord.shape
+    ms = min(m_succ, m)
+    head = blk_ord[:, :ms]
+    succ = (head + 1).clamp(max=full - 1)
+    pairs = torch.stack((head, succ), dim=-1).view(kv, 2 * ms)
+    seq = torch.cat((pairs, blk_ord[:, ms:]), dim=-1) if ms < m else pairs
+    top_prio = _dedup_priority(seq, u)
+    return top_prio, top_prio.sort(-1).values
+
+
+def _second_hop_blocks(arc: Archive, blk_ord: torch.Tensor, full: int, n_valid: int,
+                       block: int, k2: int = 64, c2_cap: int = 512) -> torch.Tensor:
+    """Two-hop key-to-key bridge retrieval over the position-invariant unrotated key slice `d // 4 :`."""
+    kv = blk_ord.shape[0]
+    d = arc.keys.shape[2]
+    d0 = d // 4
+    m1 = min(6, blk_ord.shape[1])
+    b1 = blk_ord[:, :m1]
+    b_seed = _dedup_priority(
+        torch.stack((b1, (b1 + 1).clamp(max=full - 1)), dim=-1).view(kv, 2 * m1),
+        min(10, full),
+    )
+    k_seed = _gather_blocks(arc.keys, b_seed, block).to(device=arc.kmax.device).float()[..., d0:]   # [KV, S, D_u]
+    k_mean = 0.5 * (arc.kmax[:, :full, d0:] + arc.kmin[:, :full, d0:]).mean(1, keepdim=True)        # [KV, 1, D_u]
+    q2 = F.normalize(k_seed - k_mean, dim=-1)                                                       # [KV, S, D_u]
+    kmax2 = (arc.kmax[:, :full, d0:] - k_mean).transpose(-1, -2)                                    # [KV, D_u, full]
+    kmin2 = (arc.kmin[:, :full, d0:] - k_mean).transpose(-1, -2)
+    s2 = q2.clamp(min=0) @ kmax2 + q2.clamp(max=0) @ kmin2                                          # [KV, S, full]
+    if arc.hole_hi > arc.hole_lo:
+        b0 = max(0, arc.hole_lo - ORIGIN) // block
+        b_hi = min(full, (arc.hole_hi - ORIGIN + block - 1) // block)
+        if b_hi > b0:
+            s2[..., b0:b_hi] = float("-inf")
+    s2_fin = s2.masked_fill(s2.isinf(), 0.0)
+    s2_rel = s2 - s2_fin.mean(1, keepdim=True)
+    s2_rel_fin = s2_rel.masked_fill(s2.isinf(), 0.0)
+    z2 = (s2_rel - s2_rel_fin.mean(-1, keepdim=True)) / s2_rel_fin.std(-1, keepdim=True).clamp(min=1e-6)  # [KV, S, full]
+    c2 = min(c2_cap, n_valid)
+    cand2 = z2.amax(1).topk(c2, dim=-1).indices                                                     # [KV, c2]
+    ck2 = _gather_blocks(arc.keys, cand2, block).to(device=arc.kmax.device).float()[..., d0:] - k_mean
+    ck2 = F.normalize(ck2, dim=-1)                                                                  # [KV, c2*B, D_u]
+    n_q2 = min(128, q2.shape[1])
+    top_q_idx = z2.amax(-1).topk(n_q2, dim=-1).indices                                              # [KV, n_q2]
+    q2_top = q2.gather(1, top_q_idx.unsqueeze(-1).expand(-1, -1, q2.shape[-1]))                     # [KV, n_q2, D_u]
+    ex2 = torch.bmm(q2_top, ck2.transpose(-1, -2)).view(kv, n_q2, c2, block).amax(-1)               # [KV, n_q2, c2]
+    ex2_rel = ex2 - ex2.mean(1, keepdim=True)
+    ze2 = (ex2_rel - ex2_rel.mean(-1, keepdim=True)) / ex2_rel.std(-1, keepdim=True).clamp(min=1e-6)
+    er2 = _ranks(ex2)
+    e2_tier = er2.amin(1) * c2 + _ranks(ex2.amax(1))
+    e2_z = _ranks(ze2.amax(1))
+    u2 = min(k2, c2)
+    inter2 = torch.stack(((-e2_z).topk(u2, dim=-1).indices,
+                          (-e2_tier).topk(u2, dim=-1).indices), dim=-1).view(kv, 2 * u2)
+    keep2 = _dedup_priority(inter2, u2)
+    return cand2.gather(-1, keep2)
+
+
+def retrieve_blocks_per_token(arc: Archive, q: torch.Tensor, groups: int, limit: int, budget: int = 0,
+                              lead: int | None = None, union: int = 0,
+                              q_hist: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None] | None:
+    """Per-query Z-score + tiered + 2-hop retrieval with [b, b+1] successor expansion and prompt-question retention."""
+    block = MEMORY["block_size"]
+    full = (limit - ORIGIN) // block
+    if full <= 0:
+        return None
+    if lead == 0 and q.shape[0] == 1:
+        arc.decode_step += 1
+        if (DECODE_STRIDE > 1 and arc.decode_step > 2 and (arc.decode_step - 1) % DECODE_STRIDE != 0
+                and arc.cached_top is not None):
+            return arc.cached_top, None
+    elif lead is not None and lead < 0:
+        arc.decode_step = 0
+        arc.last_hop_head = None
+        arc.cached_top = arc.cached_rk = arc.cached_rv = None
+        arc.cached_pre_k = arc.cached_pre_v = None
+        arc.cached_ns = -1
+    arc.refresh_bounds(block)
+    q_eval = (torch.cat((q_hist[:-1], q), dim=0)
+              if (q_hist is not None and lead == 0 and q_hist.shape[0] > 1) else q)
+    t_ev, h, d = q_eval.shape
+    kv = h // groups
+    qg = q_eval.float().permute(1, 0, 2).reshape(kv, groups * t_ev, d)                 # rows ordered (g, t)
+    pos, neg = qg.clamp(min=0), qg.clamp(max=0)
+    kmax_t, kmin_t = arc.kmax[:, :full].transpose(-1, -2), arc.kmin[:, :full].transpose(-1, -2)
+    score = (pos @ kmax_t + neg @ kmin_t).view(kv, groups, t_ev, full).amax(1)         # [KV, T_eval, full]
+    n_valid = full
+    if arc.hole_hi > arc.hole_lo:
+        b0 = max(0, arc.hole_lo - ORIGIN) // block
+        b1 = min(full, (arc.hole_hi - ORIGIN + block - 1) // block)
+        if b1 > b0:
+            score[..., b0:b1] = float("-inf")
+            n_valid = full - (b1 - b0)
+        if n_valid <= 0:
+            return None
+    if not budget:
+        budget = MEMORY["decode_blocks"] or MEMORY["blocks"]
+    n_arch = max(full, (arc.prompt_len - MEMORY["window"] - ORIGIN) // block)
+    for s_thresh, s_blocks in zip(SCALE[0::2], SCALE[1::2]):
+        if n_arch > s_thresh:
+            budget = max(budget, s_blocks)
+    k = min(max(budget, 1536 if n_arch > 8192 else (512 if n_arch > 4096 else (384 if n_arch > 2048 else 256))), n_valid)
+    rerank_pool = max(MEMORY["rerank"], 2 * k) if MEMORY["rerank"] > 0 else 0
+    c0 = min(max(rerank_pool, k), n_valid)
+    cand_mult = max(PERTOKEN_CAND, 2) if (lead is not None or t_ev > 1) else max(PERTOKEN_CAND, 1)
+    if lead == 0 and arc.decode_step > 2 and arc.prompt_top is not None:
+        c = min(max(k, 768), n_valid)
+    elif lead == 0 and arc.prompt_top is not None:
+        c = min(max(k, 1536), n_valid)
+    else:
+        c_floor = ((16384 if (lead is not None and lead < 0) else 8192) if n_arch > 8192
+                   else (4096 if n_arch > 4096 else (3072 if n_arch > 2048 else 1536)))
+        c = min(max(c0 * cand_mult, c_floor), n_valid)
+    s_fin = score.masked_fill(score.isinf(), 0.0)
+    s_rel = score - s_fin.mean(1, keepdim=True) if t_ev > 1 else score
+    s_rel_fin = s_rel.masked_fill(score.isinf(), 0.0)
+    z_score_rel = (s_rel - s_rel_fin.mean(-1, keepdim=True)) / s_rel_fin.std(-1, keepdim=True).clamp(min=1e-6)
+    z_score_raw = (score - s_fin.mean(-1, keepdim=True)) / s_fin.std(-1, keepdim=True).clamp(min=1e-6)
+    ranks = _ranks(score)                                                              # [KV, T_eval, full]
+    r_tier = ranks.amin(1) * full + _ranks(score.amax(1))                              # [KV, full]
+    if lead is not None and lead < 0 and t_ev > 36:
+        t_tail = min(t_ev, 96)
+        r_tail = ranks[:, -t_tail:].amin(1) * full + _ranks(score[:, -t_tail:].amax(1))
+        r_z_rel = _ranks(z_score_rel[:, -t_tail:].amax(1))
+        r_z_raw = _ranks(z_score_raw[:, -t_tail:].amax(1))
+        cand_inter = torch.stack(((-r_tail).topk(c, dim=-1).indices,
+                                  (-r_z_rel).topk(c, dim=-1).indices,
+                                  (-r_z_raw).topk(c, dim=-1).indices,
+                                  (-r_tier).topk(c, dim=-1).indices), dim=-1).view(kv, 4 * c)
+    elif lead == 0 and t_ev > 8:
+        t_dec = min(t_ev, 16)
+        r_tail = ranks[:, -8:].amin(1) * full + ranks[:, -t_dec:].amin(1)
+        r_z_rel = _ranks(z_score_rel[:, -t_dec:].amax(1))
+        r_z_raw = _ranks(z_score_raw[:, -t_dec:].amax(1))
+        cand_inter = torch.stack(((-r_tail).topk(c, dim=-1).indices,
+                                  (-r_z_rel).topk(c, dim=-1).indices,
+                                  (-r_z_raw).topk(c, dim=-1).indices,
+                                  (-r_tier).topk(c, dim=-1).indices), dim=-1).view(kv, 4 * c)
+    else:
+        r_z_rel = _ranks(z_score_rel.amax(1))
+        r_z_raw = _ranks(z_score_raw.amax(1))
+        cand_inter = torch.stack(((-r_z_rel).topk(c, dim=-1).indices,
+                                  (-r_z_raw).topk(c, dim=-1).indices,
+                                  (-r_tier).topk(c, dim=-1).indices), dim=-1).view(kv, 3 * c)
+    cand = _dedup_priority(cand_inter, c)                                              # [KV, c]
+    arc.last_top = arc.last_rk = None
+    if MEMORY["rerank"]:
+        exact_parts = []
+        for c_s in range(0, c, 1024):
+            c_e = min(c, c_s + 1024)
+            ck_part = _gather_blocks(arc.keys, cand[:, c_s:c_e], block).to(device=q.device, dtype=torch.float32)
+            ex_part = torch.bmm(qg, ck_part.transpose(-1, -2)).view(kv, groups, t_ev, c_e - c_s, block).amax(-1).amax(1)
+            exact_parts.append(ex_part)
+        exact = torch.cat(exact_parts, dim=-1) if len(exact_parts) > 1 else exact_parts[0]
+    else:
+        exact = score.gather(-1, cand.unsqueeze(1).expand(kv, t_ev, c))
+    e_fin = exact.masked_fill(exact.isinf(), 0.0)
+    e_rel = exact - e_fin.mean(1, keepdim=True) if t_ev > 1 else exact
+    e_rel_fin = e_rel.masked_fill(exact.isinf(), 0.0)
+    z_exact_rel = (e_rel - e_rel_fin.mean(-1, keepdim=True)) / e_rel_fin.std(-1, keepdim=True).clamp(min=1e-6)
+    z_exact_raw = (exact - e_fin.mean(-1, keepdim=True)) / e_fin.std(-1, keepdim=True).clamp(min=1e-6)
+    er = _ranks(exact)                                                                 # [KV, T_eval, c]
+    e_tier = er.amin(1) * c + _ranks(exact.amax(1))                                    # [KV, c]
+    if lead is not None and lead < 0 and t_ev > 36:
+        t_tail = min(t_ev, 96)
+        e_tail = er[:, -t_tail:].amin(1) * c + _ranks(exact[:, -t_tail:].amax(1))
+        e_z_rel = _ranks(z_exact_rel[:, -t_tail:].amax(1))
+        e_z_raw = _ranks(z_exact_raw[:, -t_tail:].amax(1))
+        keep_inter = torch.stack(((-e_z_rel).topk(k, dim=-1).indices,
+                                  (-e_z_raw).topk(k, dim=-1).indices,
+                                  (-e_tail).topk(k, dim=-1).indices,
+                                  (-e_tier).topk(k, dim=-1).indices), dim=-1).view(kv, 4 * k)
+    elif lead == 0 and t_ev > 8:
+        t_dec = min(t_ev, 16)
+        e_tail = er[:, -8:].amin(1) * c + er[:, -t_dec:].amin(1)
+        e_z_rel = _ranks(z_exact_rel[:, -t_dec:].amax(1))
+        e_z_raw = _ranks(z_exact_raw[:, -t_dec:].amax(1))
+        keep_inter = torch.stack(((-e_tail).topk(k, dim=-1).indices,
+                                  (-e_z_rel).topk(k, dim=-1).indices,
+                                  (-e_z_raw).topk(k, dim=-1).indices,
+                                  (-e_tier).topk(k, dim=-1).indices), dim=-1).view(kv, 4 * k)
+    else:
+        e_z_rel = _ranks(z_exact_rel.amax(1))
+        e_z_raw = _ranks(z_exact_raw.amax(1))
+        keep_inter = torch.stack(((-e_z_rel).topk(k, dim=-1).indices,
+                                  (-e_z_raw).topk(k, dim=-1).indices,
+                                  (-e_tier).topk(k, dim=-1).indices), dim=-1).view(kv, 3 * k)
+    keep_ord = _dedup_priority(keep_inter, k)                                          # [KV, k]
+    blk_ord = cand.gather(-1, keep_ord)                                                # [KV, k]
+    if MEMORY["rerank"] and n_valid > 16:
+        n_seed = min(8, blk_ord.shape[1])
+        cur_head = blk_ord[:, :n_seed]
+        run_hop2 = (lead is None or lead < 0 or arc.decode_step <= 2 or arc.last_hop_head is None
+                    or cur_head.shape != arc.last_hop_head.shape or not torch.equal(cur_head, arc.last_hop_head))
+        if run_hop2:
+            arc.last_hop_head = cur_head
+            c2_cap = 256 if (lead == 0 and arc.decode_step > 2) else (384 if lead == 0 else 512)
+            hop2 = _second_hop_blocks(arc, blk_ord, full, n_valid, block, k2=min(64, max(32, k // 4)), c2_cap=c2_cap)
+            n_head = min(16, blk_ord.shape[1])
+            blk_ord = _dedup_priority(torch.cat((blk_ord[:, :n_head], hop2, blk_ord[:, n_head:]), dim=-1), k)
+    if lead is not None and lead < 0:
+        arc.prompt_top = blk_ord
+        arc.decode_top = None
+        merged_ord = blk_ord
+    elif arc.prompt_top is not None:
+        if arc.decode_top is not None:
+            d_prev = arc.decode_top.clamp(max=full - 1)
+            k_d = min(d_prev.shape[1], blk_ord.shape[1])
+            d_inter = torch.stack((blk_ord[:, :k_d], d_prev[:, :k_d]), dim=-1).view(kv, 2 * k_d)
+            d_merged = torch.cat((d_inter, blk_ord[:, k_d:]), dim=-1) if k_d < blk_ord.shape[1] else d_inter
+            blk_ord = _dedup_priority(d_merged, k)
+        arc.decode_top = blk_ord
+        p_prev = arc.prompt_top.clamp(max=full - 1)
+        k_p = min(p_prev.shape[1], blk_ord.shape[1])
+        inter = torch.stack((p_prev[:, :k_p], blk_ord[:, :k_p]), dim=-1).view(kv, 2 * k_p)
+        merged = torch.cat((inter, blk_ord[:, k_p:]), dim=-1) if k_p < blk_ord.shape[1] else inter
+        merged_ord = _dedup_priority(merged, k)
+    else:
+        merged_ord = blk_ord
+    m_succ = min(640, k) if k > 1024 else k
+    _, blk = _expand_successors_dedup(merged_ord, full, k, m_succ=m_succ)
+    STATS["retrievals"] += 1
+    STATS["pertoken"] += 1
+    return blk, None
+
+
+_CU_TABLES: dict[torch.device, torch.Tensor] = {}
+
+
+def _get_cu(arc: Archive, t: int, w_len: int, p_len: int, device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    tbl = _CU_TABLES.get(device)
+    max_n = max(t, w_len, p_len) + 1
+    if tbl is None or tbl.shape[0] < max_n:
+        cap = max(131072, 1 << max_n.bit_length())
+        tbl = torch.stack((torch.zeros(cap, device=device, dtype=torch.int32),
+                           torch.arange(cap, device=device, dtype=torch.int32)), dim=-1)
+        _CU_TABLES[device] = tbl
+    return tbl[t], tbl[w_len], (tbl[p_len] if p_len > 0 else None)
+
+
 def piece_attention(arc: Archive, q: torch.Tensor, q_pos: torch.Tensor, top: torch.Tensor | None, groups: int,
-                    window: int, scale: float) -> torch.Tensor:
+                    window: int, scale: float, own: torch.Tensor | None = None,
+                    q_min: int | None = None, q_max: int | None = None) -> torch.Tensor:
     """Exact attention of piece q [T, H, D] at positions q_pos over its sliding window (from the archive) plus the
-    retrieved blocks `top` [KV, k]; returns [T, H, D]."""
+    retrieved blocks `top` [KV, k]; with `own` [KV, T, k] each query sees only its own retrieved blocks.
+    Returns [T, H, D]."""
     block = MEMORY["block_size"]
     t, h, d = q.shape
     kv = h // groups
-    lo = max(0, int(q_pos.min()) - window + 1)
-    hi = int(q_pos.max()) + 1
-    wk, wv = arc.keys[:, lo:hi], arc.values[:, lo:hi]                                 # [KV, Wn, D]
-    wpos = torch.arange(lo, hi, device=q.device)
-    allow = (wpos[None, :] <= q_pos[:, None]) & (wpos[None, :] >= q_pos[:, None] - window + 1)   # [T, Wn]
-    if top is not None:
-        idx = (top.unsqueeze(-1) * block + torch.arange(block, device=q.device)).view(kv, -1)
-        gather = idx.unsqueeze(-1).expand(-1, -1, d)
-        rk, rv = arc.keys.gather(1, gather), arc.values.gather(1, gather)              # [KV, R, D]
-        keys = torch.cat((rk, wk), dim=1)
-        vals = torch.cat((rv, wv), dim=1)
-        allow = torch.cat((torch.ones(t, rk.shape[1], dtype=torch.bool, device=q.device), allow), dim=1)
+    if q_min is None or q_max is None:
+        q_min, q_max = int(q_pos.min()), int(q_pos.max())
+        contig_q = (t == 1 or (q_max - q_min == t - 1 and int(q_pos[0]) == q_min and int(q_pos[-1]) == q_max))
     else:
-        keys, vals = wk, wv
-    keys = keys.repeat_interleave(groups, dim=0)                                        # [H, N, D]
-    vals = vals.repeat_interleave(groups, dim=0)
-    out = F.scaled_dot_product_attention(q.transpose(0, 1).unsqueeze(0), keys.unsqueeze(0), vals.unsqueeze(0),
-                                         attn_mask=allow[None, None], scale=scale)
-    return out[0].transpose(0, 1).to(q.dtype)
+        contig_q = (t == 1 or (q_max - q_min == t - 1))
+    lo = max(0, q_min - window + 1)
+    hi = q_max + 1
+    use_lse = (own is None and LSE and HAS_FA2 and q.is_cuda and q.dtype in (torch.bfloat16, torch.float16) and contig_q)
+    tail0 = ORIGIN + ((lo - ORIGIN) // block) * block
+    fold_tail = bool(use_lse and t == 1 and FAITHFUL and top is not None and lo > tail0)
+    w_lo = tail0 if fold_tail else lo
+    ns = min(SINKS, lo)                                                                # sink positions below the window
+    if use_lse:
+        if arc.gpu_k is not None and w_lo >= arc.gpu_lo and hi <= arc.gpu_hi:
+            wk_t = arc.gpu_k[w_lo - arc.gpu_lo : hi - arc.gpu_lo].to(dtype=q.dtype)    # [Wn, KV, D] zero-copy slice
+            wv_t = arc.gpu_v[w_lo - arc.gpu_lo : hi - arc.gpu_lo].to(dtype=q.dtype)
+        else:
+            wk_t = arc.keys[:, w_lo:hi].to(device=q.device, dtype=q.dtype).transpose(0, 1)
+            wv_t = arc.values[:, w_lo:hi].to(device=q.device, dtype=q.dtype).transpose(0, 1)
+        if t == 1 and top is not None:
+            if (arc.cached_top is not None and arc.cached_pre_k is not None and arc.cached_pre_v is not None
+                    and arc.cached_ns == ns and arc.cached_top.shape == top.shape
+                    and (top is arc.cached_top or torch.equal(top, arc.cached_top))):
+                pre_k = arc.cached_pre_k.to(dtype=q.dtype)
+                pre_v = arc.cached_pre_v.to(dtype=q.dtype)
+            else:
+                rk, rv = _gather_cached_delta(arc, top, block, q.dtype, q.device)
+                arc.last_top = arc.last_rk = None
+                arc.cached_top = top
+                arc.cached_rk = rk
+                arc.cached_rv = rv
+                if ns > 0:
+                    if arc.sink_k is not None and ns <= arc.sink_k.shape[0]:
+                        sk_t = arc.sink_k[:ns].to(dtype=q.dtype)
+                        sv_t = arc.sink_v[:ns].to(dtype=q.dtype)
+                    else:
+                        sk_t = arc.keys[:, :ns].to(device=q.device, dtype=q.dtype).transpose(0, 1)
+                        sv_t = arc.values[:, :ns].to(device=q.device, dtype=q.dtype).transpose(0, 1)
+                    pre_k = torch.cat((sk_t, rk.transpose(0, 1)), dim=0)
+                    pre_v = torch.cat((sv_t, rv.transpose(0, 1)), dim=0)
+                else:
+                    pre_k = rk.transpose(0, 1).contiguous()
+                    pre_v = rv.transpose(0, 1).contiguous()
+                arc.cached_ns = ns
+                arc.cached_pre_k = pre_k
+                arc.cached_pre_v = pre_v
+            cu_q, cu_w, cu_p = _get_cu(arc, t, wk_t.shape[0], pre_k.shape[0], q.device)
+            out_w, lse_w = torch.ops._vllm_fa2_C.varlen_fwd(
+                q, wk_t, wv_t, None, cu_q, cu_w, None, None, None, None,
+                t, wk_t.shape[0], 0.0, scale, False, False, -1, -1, 0.0, False, 0, None
+            )
+            out_p, lse_p = torch.ops._vllm_fa2_C.varlen_fwd(
+                q, pre_k, pre_v, None, cu_q, cu_p, None, None, None, None,
+                t, pre_k.shape[0], 0.0, scale, False, False, -1, -1, 0.0, False, 0, None
+            )
+            w = torch.sigmoid(lse_p - lse_w).transpose(0, 1).unsqueeze(-1)
+            return torch.lerp(out_w.float(), out_p.float(), w).to(q.dtype)
+    elif arc.gpu_k is not None and lo >= arc.gpu_lo and hi <= arc.gpu_hi:
+        wk = arc.gpu_k[lo - arc.gpu_lo : hi - arc.gpu_lo].transpose(0, 1).to(dtype=q.dtype)
+        wv = arc.gpu_v[lo - arc.gpu_lo : hi - arc.gpu_lo].transpose(0, 1).to(dtype=q.dtype)
+    else:
+        wk = arc.keys[:, lo:hi].to(device=q.device).to(dtype=q.dtype)                  # [KV, Wn, D]
+        wv = arc.values[:, lo:hi].to(device=q.device).to(dtype=q.dtype)
+    unmasked = (t == 1 and own is None)
+    need_mask = not (use_lse or unmasked)
+    parts_k, parts_v, parts_allow = [], [], []
+    if ns > 0:
+        if arc.sink_k is not None and ns <= arc.sink_k.shape[0]:
+            parts_k.append(arc.sink_k[:ns].transpose(0, 1).to(dtype=q.dtype))
+            parts_v.append(arc.sink_v[:ns].transpose(0, 1).to(dtype=q.dtype))
+        else:
+            parts_k.append(arc.keys[:, :ns].to(device=q.device).to(dtype=q.dtype))
+            parts_v.append(arc.values[:, :ns].to(device=q.device).to(dtype=q.dtype))
+        if need_mask:
+            parts_allow.append(torch.ones(t, ns, dtype=torch.bool, device=q.device))
+    if top is not None:
+        if arc.last_top is top and arc.last_rk is not None:
+            rk = arc.last_rk.to(dtype=q.dtype)
+        else:
+            rk = _gather_blocks(arc.keys, top, block).to(device=q.device).to(dtype=q.dtype)       # [KV, R, D]
+        arc.last_top = arc.last_rk = None
+        rv = _gather_blocks(arc.values, top, block).to(device=q.device).to(dtype=q.dtype)
+        arc.cached_top = arc.cached_rk = arc.cached_rv = None
+        arc.cached_pre_k = arc.cached_pre_v = None
+        parts_k.append(rk); parts_v.append(rv)
+        if need_mask:
+            if own is not None:
+                parts_allow.append(own.to(q.device).repeat_interleave(block, dim=-1))      # [KV, T, R]
+            else:
+                parts_allow.append(torch.ones(t, rk.shape[1], dtype=torch.bool, device=q.device))
+        if FAITHFUL and lo > tail0:   # the PyTorch tier always keeps the partial block just older than the window
+            if arc.gpu_k is not None and tail0 >= arc.gpu_lo and lo <= arc.gpu_hi:
+                parts_k.append(arc.gpu_k[tail0 - arc.gpu_lo : lo - arc.gpu_lo].transpose(0, 1).to(dtype=q.dtype))
+                parts_v.append(arc.gpu_v[tail0 - arc.gpu_lo : lo - arc.gpu_lo].transpose(0, 1).to(dtype=q.dtype))
+            else:
+                parts_k.append(arc.keys[:, tail0:lo].to(device=q.device).to(dtype=q.dtype))
+                parts_v.append(arc.values[:, tail0:lo].to(device=q.device).to(dtype=q.dtype))
+            if need_mask:
+                parts_allow.append(torch.ones(t, lo - tail0, dtype=torch.bool, device=q.device))
+    if use_lse:
+        if not parts_k:
+            cu_q, cu_w, _ = _get_cu(arc, t, wk_t.shape[0], 0, q.device)
+            out_w, _ = torch.ops._vllm_fa2_C.varlen_fwd(
+                q, wk_t, wv_t, None, cu_q, cu_w, None, None, None, None,
+                t, wk_t.shape[0], 0.0, scale, False, True, window - 1, 0, 0.0, False, 0, None
+            )
+            return out_w.to(q.dtype)
+        pre_k = (parts_k[0] if len(parts_k) == 1 else torch.cat(parts_k, dim=1)).transpose(0, 1)
+        pre_v = (parts_v[0] if len(parts_v) == 1 else torch.cat(parts_v, dim=1)).transpose(0, 1)
+        cu_q, cu_w, cu_p = _get_cu(arc, t, wk_t.shape[0], pre_k.shape[0], q.device)
+        out_w, lse_w = torch.ops._vllm_fa2_C.varlen_fwd(
+            q, wk_t, wv_t, None, cu_q, cu_w, None, None, None, None,
+            t, wk_t.shape[0], 0.0, scale, False, True, window - 1, 0, 0.0, False, 0, None
+        )
+        out_p, lse_p = torch.ops._vllm_fa2_C.varlen_fwd(
+            q, pre_k, pre_v, None, cu_q, cu_p, None, None, None, None,
+            t, pre_k.shape[0], 0.0, scale, False, False, -1, -1, 0.0, False, 0, None
+        )
+        w = torch.sigmoid(lse_p - lse_w).transpose(0, 1).unsqueeze(-1)
+        return torch.lerp(out_w.float(), out_p.float(), w).to(q.dtype)
+    parts_k.append(wk); parts_v.append(wv)
+    if need_mask:
+        wpos = torch.arange(lo, hi, device=q.device)
+        allow = (wpos[None, :] <= q_pos[:, None]) & (wpos[None, :] >= q_pos[:, None] - window + 1)   # [T, Wn]
+        parts_allow.append(allow)
+    keys, vals = torch.cat(parts_k, dim=1), torch.cat(parts_v, dim=1)
+    # Grouped-query layout: query head h uses KV head h // groups, so stack each group's queries along the
+    # sequence axis ([KV, groups*T, D]) instead of replicating K/V per query head.
+    qg = q.transpose(0, 1).reshape(kv, groups * t, d)                                  # [KV, G*T, D]
+    if not need_mask:
+        mask = None
+    elif own is not None:   # per-KV-head masks [KV, G*T, N]
+        allow = torch.cat([a if a.dim() == 3 else a.expand(kv, -1, -1) for a in parts_allow], dim=-1)
+        mask = allow.repeat(1, groups, 1)[None]
+    else:
+        mask = torch.cat(parts_allow, dim=1).repeat(groups, 1)[None, None]
+    out = F.scaled_dot_product_attention(qg.unsqueeze(0), keys.unsqueeze(0), vals.unsqueeze(0),
+                                         attn_mask=mask, scale=scale)
+    return out[0].reshape(h, t, d).transpose(0, 1).to(q.dtype)
 
 
 def install_runner_hooks() -> None:
@@ -170,21 +910,49 @@ def install_runner_hooks() -> None:
     if getattr(GPUModelRunner, "_pb27_hooked", False):
         return
     orig_prepare = GPUModelRunner.prepare_inputs
+    orig_add = RequestState.add_request
     orig_remove = RequestState.remove_request
 
     def prepare_inputs(self, *args, **kwargs):
         ib = orig_prepare(self, *args, **kwargs)
         BATCH["ib"] = ib
+        BATCH["pos_list"] = None
         return ib
 
+    def add_request(self, req_id, prompt_len, *args, **kwargs):
+        PROMPT_LENS[req_id] = int(prompt_len)
+        all_token_ids = kwargs.get("all_token_ids", args[0] if len(args) > 0 else None)
+        num_computed = kwargs.get("num_computed_tokens", args[1] if len(args) > 1 else 0)
+        if all_token_ids is not None and num_computed:
+            adopt_for_request(req_id, all_token_ids, int(num_computed))
+        return orig_add(self, req_id, prompt_len, *args, **kwargs)
+
     def remove_request(self, req_id, *args, **kwargs):
-        drop_request(req_id)
+        tokens = None
+        if RETAIN > 0 and req_id in self.req_id_to_index:
+            idx = self.req_id_to_index[req_id]
+            try:   # prompt + accepted output tokens, maintained on the GPU by the runner's post-update step
+                n = int(self.total_len.gpu[idx])
+                tokens = self.all_token_ids.gpu[idx, :n].clone()
+            except Exception as exc:   # internals differ: fall back to no retention
+                log.warning("pb27 memory: cannot read token ids for %s (%s); not retaining", req_id, exc)
+        drop_request(req_id, tokens)
         return orig_remove(self, req_id, *args, **kwargs)
 
     GPUModelRunner.prepare_inputs = prepare_inputs
+    RequestState.add_request = add_request
     RequestState.remove_request = remove_request
     GPUModelRunner._pb27_hooked = True
     log.info("pb27 memory tier: runner hooks installed (pid %d), config %s", os.getpid(), MEMORY)
+
+
+def _layer_enabled(layer_name: str) -> bool:
+    if LAYER_STRIDE <= 1:
+        return True
+    for part in layer_name.split("."):
+        if part.isdigit():
+            return (int(part) % LAYER_STRIDE) == 0
+    return True
 
 
 def windowed_attention_with_memory(attn_module, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -198,6 +966,9 @@ def windowed_attention_with_memory(attn_module, q: torch.Tensor, k: torch.Tensor
     if ib is None or not ib.req_ids:
         STATS["fallback"] += 1
         return out
+    layer = attn_module.layer_name
+    if not _layer_enabled(layer):
+        return out
     impl = attn_module.impl
     H, KV, D = impl.num_heads, impl.num_kv_heads, impl.head_size
     groups = H // KV
@@ -205,29 +976,141 @@ def windowed_attention_with_memory(attn_module, q: torch.Tensor, k: torch.Tensor
     T = ib.num_tokens
     qh, kh, vh = q[:T].view(T, H, D), k[:T].view(T, KV, D), v[:T].view(T, KV, D)
     pos = positions[0, :T] if positions.dim() == 2 else positions[:T]
+    pos_list = BATCH.get("pos_list")
+    if pos_list is None or len(pos_list) != T:
+        pos_list = pos.tolist()
+        BATCH["pos_list"] = pos_list
     qsl = ib.query_start_loc_np
     block, piece = MEMORY["block_size"], MEMORY["chunk"]
-    layer = attn_module.layer_name
     out_h = out[:T].view(T, H, D)
     for i, req_id in enumerate(ib.req_ids):
         s, e = int(qsl[i]), int(qsl[i + 1])
         if e <= s:
             continue
+        p_first, p_last = int(pos_list[s]), int(pos_list[e - 1])
         key = (req_id, layer)
         arc = ARCHIVES.get(key)
         if arc is None:
-            arc = ARCHIVES[key] = Archive.new(KV, D, max(block * 64, 1 << 15), block, kh.dtype, kh.device)
-        arc.write(pos[s:e], kh[s:e], vh[s:e], block)
-        if int(pos[e - 1]) + 1 <= window:
+            plen = PROMPT_LENS.get(req_id, 0)
+            if max(plen, p_last + 1) + 1024 <= window and req_id not in ADOPTED and RETAIN <= 0:
+                continue
+            adopted, h_lo, h_hi, n_cached = ADOPTED.get(req_id, ({}, 0, 0, 0))
+            arc = adopted.pop(layer, None)
+            if arc is None:
+                max_hint = max(plen, p_last + 1) + 2048
+                init_cap = max(block * 16, 1 << 10, 1 << (max_hint - 1).bit_length())
+                arc = Archive.new(KV, D, init_cap, block, kh.dtype, kh.device, max_hint=max_hint)
+                h_lo, h_hi = (0, n_cached) if n_cached else (0, 0)   # cached prefix with no archive
+            else:
+                valid_end = n_cached if h_hi <= h_lo else h_lo
+                arc.size = min(arc.size, valid_end)
+                if arc.gpu_k is not None:
+                    if valid_end < arc.gpu_lo:
+                        arc.gpu_k = arc.gpu_v = None
+                    else:
+                        arc.gpu_hi = min(arc.gpu_hi, valid_end)
+                if valid_end > ORIGIN:
+                    b_tail = (valid_end - 1 - ORIGIN) // block
+                    arc.dirty_lo, arc.dirty_hi = min(arc.dirty_lo, b_tail), max(arc.dirty_hi, b_tail)
+            arc.hole_lo, arc.hole_hi = h_lo, h_hi
+            arc.prompt_len = plen
+            arc.prompt_top = None
+            arc.decode_top = None
+            arc.decode_step = 0
+            arc.last_hop_head = None
+            arc.cached_top = arc.cached_rk = arc.cached_rv = None
+            arc.cached_pre_k = arc.cached_pre_v = None
+            arc.cached_ns = -1
+            arc.cached_cu = None
+            ARCHIVES[key] = arc
+        arc.write(pos[s:e], kh[s:e], vh[s:e], block, p0=p_first, hi=p_last + 1)
+        if QWIN or PERTOKEN:
+            arc.write_q(pos[s:e], qh[s:e])
+        rerank = (e - s) <= piece or RERANK_ALL   # the PyTorch tier scores the question in its own <=64-token
+        is_prefill = (e - s) > piece               # chunk with exact rescoring; here it sits inside a prefill chunk
+        if is_prefill:
+            arc.prompt_len = max(arc.prompt_len, p_last + 1)
+        if p_last + 1 <= window:
             continue                                      # the whole context still fits the window
-        rerank = (e - s) <= piece
-        for p0 in range(s, e, piece):
-            p1 = min(e, p0 + piece)
+        if is_prefill and PREFILL == "0":
+            continue
+        # pieces are aligned to the END of the chunk, so the last piece is always a full window of the most recent
+        # tokens (the question) instead of a remainder of a few tokens
+        bounds = [(max(s, p1 - piece), p1) for p1 in range(e, s, -piece)]
+        q_piece = max(piece, 160)
+        if is_prefill and PREFILL == "pt":
+            # the PyTorch tier's decode-faithful semantics: the prefill chunk retrieves ONE block set shared by all its
+            # queries (bound only), and the final piece (the question) gets its own retrieval with exact rescoring
+            at_prompt_end = p_last + 1 >= arc.prompt_len
+            cut = (e - q_piece if e - s > q_piece else s) if at_prompt_end else e
+            bounds = []
+            if cut > s:                            # split at the same absolute 2048-token boundaries the PyTorch
+                p_s = p_first                      # stream uses (vLLM's prefill chunks can be ~8k tokens)
+                b0 = s
+                for p in range((p_s // PT_CHUNK + 1) * PT_CHUNK, p_s + (cut - s), PT_CHUNK):
+                    b = s + (p - p_s)              # positions are contiguous within a request's prefill chunk
+                    bounds.append((b0, b)); b0 = b
+                bounds.append((b0, cut))
+            if cut < e:
+                bounds.append((cut, e))
+        elif is_prefill and PREFILL not in ("0", "1"):
+            bounds = bounds[:TAIL]                 # retrieval during prefill only in the last TAIL pieces of the chunk
+        for p0, p1 in bounds:
             q_pos = pos[p0:p1]
-            limit = int(q_pos.min()) - window + 1         # archived positions older than every query's window
-            top = retrieve_blocks(arc, qh[p0:p1], groups, limit, rerank) if limit >= block else None
+            q_min, q_max = int(pos_list[p0]), int(pos_list[p1 - 1])
+            limit = q_min - window + 1                        # archived positions older than every query's window
+            if arc.hole_hi > arc.hole_lo:
+                w_lo, w_hi = max(0, limit), q_max + 1
+                sinks_missing = SINKS > 0 and w_lo > 0 and arc.hole_lo < SINKS
+                if (arc.hole_lo < w_hi and arc.hole_hi > w_lo) or sinks_missing:
+                    STATS["hole_skips"] += 1              # keep vLLM's window-only output for this piece
+                    continue
+            if is_prefill:
+                budget = PREFILL_BLOCKS
+            elif DSTEP and q_min <= arc.prompt_len:
+                budget = MEMORY["blocks"]
+            else:
+                budget = 0
+            rr = (p1 - p0) <= q_piece if PREFILL == "pt" else rerank
+            q_hist = None
+            need_q_hist = (
+                (QWIN or PERTOKEN)
+                and not is_prefill
+                and arc.qbuf is not None
+                and (
+                    QWIN
+                    or DECODE_STRIDE <= 1
+                    or arc.cached_top is None
+                    or arc.decode_step + 1 <= 2
+                    or (arc.decode_step + 1 - 1) % DECODE_STRIDE == 0
+                )
+            )
+            if need_q_hist:
+                p_end = q_min + 1
+                p_start = max(0, p_end - (piece if QWIN else min(32, piece)))
+                q_hist = arc.qbuf[torch.arange(p_start, p_end, device=qh.device) % QBUF_CAP]
+            q_ret = q_hist if (q_hist is not None and QWIN) else qh[p0:p1]
+            own = None
+            in_prompt = q_max + 1 <= arc.prompt_len
+            final_prefill = (PERTOKEN_PREFILL_UNION > 0 and (is_prefill or in_prompt) and p1 == e
+                             and q_max + 1 >= arc.prompt_len)
+            if (PERTOKEN and rr and (not is_prefill or final_prefill) and not QWIN and not ORACLE
+                    and not MEMORY["neighbors"]):
+                lead = (-1 if in_prompt else 0) if PERTOKEN_LEAD else None
+                res = (retrieve_blocks_per_token(arc, qh[p0:p1], groups, limit, budget, lead,
+                                                 PERTOKEN_PREFILL_UNION if final_prefill else 0,
+                                                 None if in_prompt else q_hist)
+                       if limit >= block else None)
+                top, own = res if res is not None else (None, None)
+            else:
+                top = retrieve_blocks(arc, q_ret, groups, limit, rr, budget) if limit >= block else None
             if top is None:
                 continue
-            out_h[p0:p1] = piece_attention(arc, qh[p0:p1], q_pos, top, groups, window, impl.scale)
+            if NORETRIEVE:
+                top, own = None, None
+            out_h[p0:p1] = piece_attention(arc, qh[p0:p1], q_pos, top, groups, window, impl.scale, own,
+                                           q_min=q_min, q_max=q_max)
             STATS["pieces"] += 1
+    if T > piece and torch.cuda.is_available() and (torch.cuda.memory_reserved() - torch.cuda.memory_allocated()) > (2 << 30):
+        torch.cuda.empty_cache()
     return out

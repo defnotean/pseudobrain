@@ -1,0 +1,29 @@
+{
+ "model": "core:/home/defnotean/x2/runs/pb27a/core.pt",
+ "results": {
+  "passkey@32768": {
+   "exact": 0.3333333333333333,
+   "answer_nll": 1.803446606810515
+  },
+  "passkey@65536": {
+   "exact": 0.3333333333333333,
+   "answer_nll": 2.072352002064387
+  },
+  "multihop@32768": {
+   "exact": 1.0,
+   "answer_nll": 0.14832046379645666
+  },
+  "multihop@65536": {
+   "exact": 0.3333333333333333,
+   "answer_nll": 1.7780962213873863
+  },
+  "copy@32768": {
+   "exact": 0.3333333333333333,
+   "answer_nll": 3.834296949363003
+  },
+  "copy@65536": {
+   "exact": 0.3333333333333333,
+   "answer_nll": 4.305655826814473
+  }
+ }
+}

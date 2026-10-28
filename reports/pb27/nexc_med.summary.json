@@ -1,0 +1,40 @@
+{
+ "n": 66,
+ "expected": 66,
+ "missing": 0,
+ "passed": 43,
+ "pass_rate": 0.6515,
+ "problems_solved_any": 26,
+ "problems": 33,
+ "by_tier": {
+  "easy": {
+   "passed": 13,
+   "n": 16,
+   "rate": 0.8125
+  },
+  "fix": {
+   "passed": 2,
+   "n": 6,
+   "rate": 0.3333
+  },
+  "hard": {
+   "passed": 12,
+   "n": 20,
+   "rate": 0.6
+  },
+  "medium": {
+   "passed": 16,
+   "n": 24,
+   "rate": 0.6667
+  }
+ },
+ "no_code": 0,
+ "finish_length": 0,
+ "mean_completion_tokens": 894,
+ "name": "nexc_med",
+ "model": "pb27",
+ "reasoning_effort": "medium",
+ "temperature": 1.0,
+ "samples": 2,
+ "max_tokens": 8192
+}

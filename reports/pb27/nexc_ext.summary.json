@@ -1,0 +1,71 @@
+{
+ "name": "nexc_ext",
+ "model": "pb27",
+ "seed": 2710,
+ "lengths": {
+  "200000": {
+   "needle": 1.0,
+   "multi4": 1.0,
+   "trace4": 1.0,
+   "probes": {
+    "needle@0.1": 1.0,
+    "needle@0.5": 1.0,
+    "needle@0.9": 1.0,
+    "multi4": 1.0,
+    "trace4": 1.0
+   },
+   "max_prompt_tokens": 195034,
+   "mean_ttft_s": 81.2,
+   "mean_decode_tok_s": 1.65,
+   "errors": 0
+  },
+  "250000": {
+   "needle": 1.0,
+   "multi4": 1.0,
+   "trace4": 1.0,
+   "probes": {
+    "needle@0.1": 1.0,
+    "needle@0.5": 1.0,
+    "needle@0.9": 1.0,
+    "multi4": 1.0,
+    "trace4": 1.0
+   },
+   "max_prompt_tokens": 244053,
+   "mean_ttft_s": 104.9,
+   "mean_decode_tok_s": 1.54,
+   "errors": 0
+  },
+  "500000": {
+   "needle": 1.0,
+   "multi4": 1.0,
+   "trace4": 1.0,
+   "probes": {
+    "needle@0.1": 1.0,
+    "needle@0.5": 1.0,
+    "needle@0.9": 1.0,
+    "multi4": 1.0,
+    "trace4": 1.0
+   },
+   "max_prompt_tokens": 488637,
+   "mean_ttft_s": 238.3,
+   "mean_decode_tok_s": 1.48,
+   "errors": 0
+  },
+  "1000000": {
+   "needle": 1.0,
+   "multi4": 1.0,
+   "trace4": 1.0,
+   "probes": {
+    "needle@0.1": 1.0,
+    "needle@0.5": 1.0,
+    "needle@0.9": 1.0,
+    "trace4": 1.0,
+    "multi4": 1.0
+   },
+   "max_prompt_tokens": 978373,
+   "mean_ttft_s": 615.4,
+   "mean_decode_tok_s": 1.2,
+   "errors": 0
+  }
+ }
+}

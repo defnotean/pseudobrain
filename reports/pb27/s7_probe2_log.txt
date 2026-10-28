@@ -1,0 +1,14 @@
+[12:47:04] code extracted
+[12:47:04] setup done
+
+exit 0
+clustered 64 MLPs into [32, 64]
+dense {"nll": 1.2992769122560381, "delta_vs_dense": 0.0, "mlp_active_fraction": 1.0, "seconds": 5.4}
+cluster:32/16 {"nll": 1.5353398032337853, "delta_vs_dense": 0.23606289097774713, "mlp_active_fraction": 0.5, "seconds": 6.0}
+cluster:32/12 {"nll": 1.7313668250649452, "delta_vs_dense": 0.4320899128089071, "mlp_active_fraction": 0.375, "seconds": 6.0}
+cluster:32/8 {"nll": 2.1073748950702074, "delta_vs_dense": 0.8080979828141692, "mlp_active_fraction": 0.25, "seconds": 6.0}
+cluster:64/32 {"nll": 1.523514087073047, "delta_vs_dense": 0.2242371748170089, "mlp_active_fraction": 0.5, "seconds": 6.1}
+cluster:64/16 {"nll": 1.9239104193694037, "delta_vs_dense": 0.6246335071133655, "mlp_active_fraction": 0.25, "seconds": 6.1}
+cluster:64/12 {"nll": 2.343646739545177, "delta_vs_dense": 1.044369827289139, "mlp_active_fraction": 0.1875, "seconds": 6.1}
+
+

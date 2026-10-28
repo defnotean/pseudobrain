@@ -6,7 +6,13 @@ touches registries and imports nothing that initialises CUDA. The model classes
 are referenced lazily by "<module>:<class>" strings.
 """
 
-ARCHS = ("PB27ForConditionalGeneration", "PB27ForCausalLM")
+ARCHS = (
+    "PB27ForConditionalGeneration",
+    "PB27ForCausalLM",
+    "PB27MoeForConditionalGeneration",
+    "PB27MoeForCausalLM",
+)
+LLAMA_ARCHS = ("PB27LlamaForCausalLM",)  # a Llama teacher (Nanbeige4.3-33B), llama_model.py
 
 
 def register() -> None:
@@ -20,14 +26,21 @@ def register() -> None:
     for arch in ARCHS:
         if arch not in ModelRegistry.get_supported_archs():
             ModelRegistry.register_model(arch, f"pb27_vllm.model:{arch}")
+    for arch in LLAMA_ARCHS:
+        if arch not in ModelRegistry.get_supported_archs():
+            ModelRegistry.register_model(arch, f"pb27_vllm.llama_model:{arch}")
 
     # The verify-and-update hooks of the stock Qwen3.5 classes (mamba SSM cache
     # dtype from the HF config; the CausalLM variant also drops the M-RoPE
-    # fields). PB-27 keeps model_type qwen3_5 / qwen3_5_text so they apply as is.
-    MODELS_CONFIG_MAP.setdefault(
-        "PB27ForConditionalGeneration", Qwen3_5ForConditionalGenerationConfig
-    )
-    MODELS_CONFIG_MAP.setdefault("PB27ForCausalLM", Qwen3_5ForCausalLMConfig)
+    # fields). PB-27 keeps model_type qwen3_5(_moe) / qwen3_5(_moe)_text so they
+    # apply as is; the stock MoE classes map to the same hooks (config.py:1061-1062).
+    for arch in ("PB27ForConditionalGeneration", "PB27MoeForConditionalGeneration"):
+        MODELS_CONFIG_MAP.setdefault(arch, Qwen3_5ForConditionalGenerationConfig)
+    for arch in ("PB27ForCausalLM", "PB27MoeForCausalLM"):
+        MODELS_CONFIG_MAP.setdefault(arch, Qwen3_5ForCausalLMConfig)
+    # The Llama path only needs the mamba SSM cache dtype hook (no M-RoPE fields to drop).
+    for arch in LLAMA_ARCHS:
+        MODELS_CONFIG_MAP.setdefault(arch, Qwen3_5ForConditionalGenerationConfig)
 
     # Exact memory tier (PB27_MEMORY env): archive bookkeeping hooks on the GPU model runner.
     from . import memory

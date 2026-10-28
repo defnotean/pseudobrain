@@ -69,21 +69,55 @@ BASH_BLOCK = re.compile(r"```bash\s*\n(.*?)\n```", re.S)
 
 
 def chat(base_url: str, model: str, messages: list[dict], args) -> tuple[dict, dict]:
+    use_stream = base_url.startswith("https://")
     body = {"model": model, "messages": messages, "max_tokens": args.max_tokens,
             "temperature": args.temperature, "top_p": args.top_p}
+    if use_stream:
+        body["stream"] = True
+        body["stream_options"] = {"include_usage": True}
     if args.top_k:
         body["top_k"] = args.top_k
     if args.chat_template_kwargs:
         body["chat_template_kwargs"] = json.loads(args.chat_template_kwargs)
     if args.reasoning_effort:
         body["reasoning_effort"] = args.reasoning_effort
-    req = urllib.request.Request(f"{base_url}/chat/completions", data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(
+        f"{base_url}/chat/completions",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json", "User-Agent": "curl/8.0"},
+    )
     for attempt in range(4):
         try:
             with urllib.request.urlopen(req, timeout=args.request_timeout) as r:
-                data = json.loads(r.read())
-            return data["choices"][0]["message"], data.get("usage", {})
+                if not use_stream:
+                    data = json.loads(r.read())
+                    return data["choices"][0]["message"], data.get("usage", {})
+                content_parts: list[str] = []
+                reasoning_parts: list[str] = []
+                usage: dict = {}
+                for raw_line in r:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        break
+                    chunk = json.loads(payload)
+                    if chunk.get("usage"):
+                        usage = chunk["usage"]
+                    choices = chunk.get("choices") or []
+                    if choices:
+                        delta = choices[0].get("delta") or {}
+                        if delta.get("content"):
+                            content_parts.append(delta["content"])
+                        rc = delta.get("reasoning_content") or delta.get("reasoning")
+                        if rc:
+                            reasoning_parts.append(rc)
+                return {
+                    "role": "assistant",
+                    "content": "".join(content_parts),
+                    "reasoning_content": "".join(reasoning_parts),
+                }, usage
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode(errors="replace")[:500]
             if exc.code == 400:  # context overflow or bad request: not retryable
@@ -254,12 +288,11 @@ def main() -> int:
     ap.add_argument("--command-timeout", type=float, default=120)
     ap.add_argument("--obs-chars", type=int, default=10000)
     ap.add_argument("--request-timeout", type=float, default=1800)
+    ap.add_argument("--reverse", action="store_true", help="process todo tasks in reverse order")
+    ap.add_argument("--rotate-mid", action="store_true", help="start from the middle of todo")
     args = ap.parse_args()
 
     tasks = [json.loads(l) for l in Path(args.tasks).read_text(encoding="utf-8").splitlines() if l.strip()]
-    if args.only:
-        keep = set(args.only.split(","))
-        tasks = [t for t in tasks if t["instance_id"] in keep]
     random.Random(0).shuffle(tasks)
     if args.limit:
         tasks = tasks[: args.limit]
@@ -270,21 +303,53 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     done = {p.stem for p in out_dir.glob("*.json") if p.stem != "summary"}
     todo = [t for t in tasks if t["instance_id"] not in done]
+    if args.only:
+        keep = set(args.only.split(","))
+        todo = [t for t in todo if t["instance_id"] in keep]
+    if args.reverse:
+        todo = list(reversed(todo))
+    if args.rotate_mid and todo:
+        mid = len(todo) // 2
+        todo = todo[mid:] + todo[:mid]
     print(f"{args.name}: {len(tasks)} tasks, {len(todo)} to run", flush=True)
 
-    def work(task: dict) -> dict:
+    def work(task: dict) -> dict | None:
+        iid = task["instance_id"]
+        out_path = out_dir / f"{iid}.json"
+        if out_path.exists():
+            return None
+        claim_path = out_dir / f".{iid}.claim"
         try:
-            res = solve(task, args)
-        except Exception as exc:
-            res = {"instance_id": task["instance_id"], "repo": task["repo"], "resolved": False,
-                   "exit_status": f"harness_error: {exc}"[:400]}
-        (out_dir / f"{task['instance_id']}.json").write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")
-        return res
+            fd = os.open(str(claim_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, f"{os.getpid()}\n".encode())
+            os.close(fd)
+        except FileExistsError:
+            return None
+        try:
+            if out_path.exists():
+                return None
+            try:
+                res = solve(task, args)
+            except Exception as exc:
+                res = {"instance_id": iid, "repo": task["repo"], "resolved": False,
+                       "exit_status": f"harness_error: {exc}"[:400]}
+            # A zero-step model error means the server was unreachable: leave the task for a retry. A model error
+            # after the agent started working (e.g. request timeout) is a genuine failure and is recorded.
+            if (str(res.get("exit_status", "")).startswith("model_error") and not res.get("resolved")
+                    and not res.get("steps")):
+                print(iid, "SKIP_SERVER_DOWN", res.get("exit_status"), flush=True)
+                time.sleep(15)
+                return None
+            out_path.write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")
+            return res
+        finally:
+            claim_path.unlink(missing_ok=True)
 
     with cf.ThreadPoolExecutor(args.workers) as pool:
         for res in pool.map(work, todo):
-            print(res["instance_id"], "RESOLVED" if res["resolved"] else "no", res.get("exit_status"),
-                  res.get("steps"), res.get("completion_tokens"), res.get("seconds"), flush=True)
+            if res is not None:
+                print(res["instance_id"], "RESOLVED" if res["resolved"] else "no", res.get("exit_status"),
+                      res.get("steps"), res.get("completion_tokens"), res.get("seconds"), flush=True)
 
     results = [json.loads(p.read_text(encoding="utf-8")) for p in out_dir.glob("*.json") if p.stem != "summary"]
     ids = {t["instance_id"] for t in tasks}

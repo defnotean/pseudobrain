@@ -1,0 +1,328 @@
+[12:15:34] setup done
+
+exit 0 python -m scripts.transplant.mlp_sparsity_probe --core core:/root/x2/r
+dense {"nll": 1.2992769122560381, "delta_vs_dense": 0.0, "mlp_active_fraction": 1.0, "seconds": 8.8}
+neuron:0.5 {"nll": 1.3082774080393709, "delta_vs_dense": 0.00900049578333273, "mlp_active_fraction": 0.5, "seconds": 7.2}
+neuron:0.35 {"nll": 1.3540346523683926, "delta_vs_dense": 0.05475774011235446, "mlp_active_fraction": 0.35, "seconds": 6.8}
+neuron:0.25 {"nll": 1.3731633199925437, "delta_vs_dense": 0.07388640773650557, "mlp_active_fraction": 0.25, "seconds": 6.5}
+neuron:0.15 {"nll": 1.4604179546898053, "delta_vs_dense": 0.16114104243376715, "mlp_active_fraction": 0.15, "seconds": 6.0}
+neuron:0.10 {"nll": 1.56696693752663, "delta_vs_dense": 0.2676900252705918, "mlp_active_fraction": 0.1, "seconds": 6.0}
+group:32/16 {"nll": 1.6485086927774917, "delta_vs_dense": 0.34923178052145354, "mlp_active_fraction": 0.5, "seconds": 5.9}
+group:32/12 {"nll": 1.9703066076357092, "delta_vs_dense": 0.671029695379671, "mlp_active_fraction": 0.375, "seconds": 5.9}
+group:32/8 {"nll": 3.2113649895388177, "delta_vs_dense": 1.9120880772827795, "mlp_active_fraction": 0.25, "seconds": 5.9}
+group:32/6 {"nll": 4.474692941245675, "delta_vs_dense": 3.175416028989637, "mlp_active_fraction": 0.1875, "seconds": 5.9}
+group:32/4 {"nll": 6.705551978403541, "delta_vs_dense": 5.4062750661475025, "mlp_active_fraction": 0.125, "seconds": 5.9}
+group:64/16 {"nll": 2.6296793421060998, "delta_vs_dense": 1.3304024298500616, "mlp_active_fraction": 0.25, "seconds": 5.9}
+group:64/8 {"nll": 5.363187945951617, "delta_vs_dense": 4.063911033695579, "mlp_active_fraction": 0.125, "seconds": 5.9}
+
+
+exit 0 python -m scripts.transplant.recall_eval --model core:/root/x2/runs/pb
+[12:23:30] pb27a needle@16000:tool: resumed
+[12:23:30] pb27a needle@16000:no_tool: resumed
+[12:23:30] pb27a multihop@16000:tool: resumed
+[12:23:30] pb27a multihop@16000:no_tool: resumed
+[12:23:30] pb27a earlier@16000:tool: resumed
+[12:23:30] pb27a earlier@16000:no_tool: resumed
+[12:23:30] pb27a copy@16000:tool: resumed
+[12:23:30] pb27a copy@16000:no_tool: resumed
+[12:24:42] pb27a needle@64000:tool: exact=1.000 calls=0.50
+[12:25:25] pb27a needle@64000:no_tool: exact=1.000 calls=0.00
+[12:27:09] pb27a multihop@64000:tool: exact=0.875 calls=1.12
+[12:27:52] pb27a multihop@64000:no_tool: exact=0.375 calls=0.00
+[12:29:19] pb27a earlier@64000:tool: exact=1.000 calls=1.00
+[12:29:57] pb27a earlier@64000:no_tool: exact=1.000 calls=0.00
+[12:31:35] pb27a copy@64000:tool: exact=1.000 calls=0.88
+[12:32:29] pb27a copy@64000:no_tool: exact=1.000 calls=0.00
+
+
+=== FILE /content/s7_probe.json
+{
+ "core": "core:/root/x2/runs/pb27a/core.pt",
+ "tokens": 24576,
+ "settings": {
+  "dense": {
+   "nll": 1.2992769122560381,
+   "delta_vs_dense": 0.0,
+   "mlp_active_fraction": 1.0,
+   "seconds": 8.8
+  },
+  "neuron:0.5": {
+   "nll": 1.3082774080393709,
+   "delta_vs_dense": 0.00900049578333273,
+   "mlp_active_fraction": 0.5,
+   "seconds": 7.2
+  },
+  "neuron:0.35": {
+   "nll": 1.3540346523683926,
+   "delta_vs_dense": 0.05475774011235446,
+   "mlp_active_fraction": 0.35,
+   "seconds": 6.8
+  },
+  "neuron:0.25": {
+   "nll": 1.3731633199925437,
+   "delta_vs_dense": 0.07388640773650557,
+   "mlp_active_fraction": 0.25,
+   "seconds": 6.5
+  },
+  "neuron:0.15": {
+   "nll": 1.4604179546898053,
+   "delta_vs_dense": 0.16114104243376715,
+   "mlp_active_fraction": 0.15,
+   "seconds": 6.0
+  },
+  "neuron:0.10": {
+   "nll": 1.56696693752663,
+   "delta_vs_dense": 0.2676900252705918,
+   "mlp_active_fraction": 0.1,
+   "seconds": 6.0
+  },
+  "group:32/16": {
+   "nll": 1.6485086927774917,
+   "delta_vs_dense": 0.34923178052145354,
+   "mlp_active_fraction": 0.5,
+   "seconds": 5.9
+  },
+  "group:32/12": {
+   "nll": 1.9703066076357092,
+   "delta_vs_dense": 0.671029695379671,
+   "mlp_active_fraction": 0.375,
+   "seconds": 5.9
+  },
+  "group:32/8": {
+   "nll": 3.2113649895388177,
+   "delta_vs_dense": 1.9120880772827795,
+   "mlp_active_fraction": 0.25,
+   "seconds": 5.9
+  },
+  "group:32/6": {
+   "nll": 4.474692941245675,
+   "delta_vs_dense": 3.175416028989637,
+   "mlp_active_fraction": 0.1875,
+   "seconds": 5.9
+  },
+  "group:32/4": {
+   "nll": 6.705551978403541,
+   "delta_vs_dense": 5.4062750661475025,
+   "mlp_active_fraction": 0.125,
+   "seconds": 5.9
+  },
+  "group:64/16": {
+   "nll": 2.6296793421060998,
+   "delta_vs_dense": 1.3304024298500616,
+   "mlp_active_fraction": 0.25,
+   "seconds": 5.9
+  },
+  "group:64/8": {
+   "nll": 5.363187945951617,
+   "delta_vs_dense": 4.063911033695579,
+   "mlp_active_fraction": 0.125,
+   "seconds": 5.9
+  }
+ }
+}
+=== FILE /root/x2/eval/recall_tool/pb27a.json
+rlier about the garage door code?",
+     "answer": "it is 2,300 euros",
+     "exact": true,
+     "calls": 0,
+     "call_trace": [],
+     "reply": "You told me: it is 2,300 euros."
+    },
+    {
+     "question": "What did I tell you earlier about my dentist appointment?",
+     "answer": "it is on the 14th of March",
+     "exact": true,
+     "calls": 0,
+     "call_trace": [],
+     "reply": "You told me: it is on the 14th of March."
+    }
+   ]
+  },
+  "copy@64000:tool": {
+   "items_sha256": "53d8d9dec2896cfcb4ec698b79c123ce41f836b122df29a7ebba69017b127bbf",
+   "exact": 1.0,
+   "mean_calls": 0.875,
+   "sample": "LJh8NoMtwh6c9eOnzxTBE8C4xJZwN9H_ZRl9CZgBrXJhEb8V5F1u1uPsHqIgtwaA",
+   "examples": [
+    {
+     "question": "Copy the token I gave you exactly.",
+     "answer": "LJh8NoMtwh6c9eOnzxTBE8C4xJZwN9H_ZRl9CZgBrXJhEb8V5F1u1uPsHqIgtwaA",
+     "exact": true,
+     "calls": 1,
+     "call_trace": [
+      {
+       "name": "recall",
+       "query": "token you will need later",
+       "answer_in_result": true
+      }
+     ],
+     "reply": "LJh8NoMtwh6c9eOnzxTBE8C4xJZwN9H_ZRl9CZgBrXJhEb8V5F1u1uPsHqIgtwaA"
+    },
+    {
+     "question": "Copy the token I gave you exactly.",
+     "answer": "Mcy1yl4Ae0-uNONZjN7iUjrnY7p4bW8ELo6bAtLWMRYlGyzWoQNJ8Q5Wlnsmqwxy",
+     "exact": true,
+     "calls": 1,
+     "call_trace": [
+      {
+       "name": "recall",
+       "query": "token you will need later",
+       "answer_in_result": true
+      }
+     ],
+     "reply": "Mcy1yl4Ae0-uNONZjN7iUjrnY7p4bW8ELo6bAtLWMRYlGyzWoQNJ8Q5Wlnsmqwxy"
+    },
+    {
+     "question": "Copy the token I gave you exactly.",
+     "answer": "jR2rAsX9Q0bZOFcHQyRN4nWAQLnuGMDTszzdzkrF",
+     "exact": true,
+     "calls": 1,
+     "call_trace": [
+      {
+       "name": "recall",
+       "query": "token you will need later",
+       "answer_in_result": true
+      }
+     ],
+     "reply": "jR2rAsX9Q0bZOFcHQyRN4nWAQLnuGMDTszzdzkrF"
+    },
+    {
+     "question": "Copy the token I gave you exactly.",
+     "answer": "iHvQspaKUEUvxj6eZxrNWcuz",
+     "exact": true,
+     "calls": 1,
+     "call_trace": [
+      {
+       "name": "recall",
+       "query": "token you will need later",
+       "answer_in_result": true
+      }
+     ],
+     "reply": "iHvQspaKUEUvxj6eZxrNWcuz"
+    },
+    {
+     "question": "Copy the token I gave you exactly.",
+     "answer": "QgesZ-n8S00K_703poQ31dPgL3WPNiFp5FYg8nENYEiV1vC1pjmqp6aLFMdPwi45",
+     "exact": true,
+     "calls": 1,
+     "call_trace": [
+      {
+       "name": "recall",
+       "query": "token you will need later",
+       "answer_in_result": true
+      }
+     ],
+     "reply": "QgesZ-n8S00K_703poQ31dPgL3WPNiFp5FYg8nENYEiV1vC1pjmqp6aLFMdPwi45 21"
+    },
+    {
+     "question": "Copy the token I gave you exactly.",
+     "answer": "fNd6ONP-s8AzLhzOT8cwzEyg",
+     "exact": true,
+     "calls": 1,
+     "call_trace": [
+      {
+       "name": "recall",
+       "query": "token you will need later",
+       "answer_in_result": true
+      }
+     ],
+     "reply": "fNd6ONP-s8AzLhzOT8cwzEyg"
+    },
+    {
+     "question": "Copy the token I gave you exactly.",
+     "answer": "rQ41kvCNpzIxELIVoDMxCJql7j4jfaKG2lvKyFwJdxte7Xa-hxiUP9eLwvo3E4GE",
+     "exact": true,
+     "calls": 1,
+     "call_trace": [
+      {
+       "name": "recall",
+       "query": "token you will need later",
+       "answer_in_result": true
+      }
+     ],
+     "reply": "rQ41kvCNpzIxELIVoDMxCJql7j4jfaKG2lvKyFwJdxte7Xa-hxiUP9eLwvo3E4GE"
+    },
+    {
+     "question": "Copy the token I gave you exactly.",
+     "answer": "tc-34HdjowEsgN2fOH-lvWGFu-6hO07UBfq_rs6f",
+     "exact": true,
+     "calls": 0,
+     "call_trace": [],
+     "reply": "tc-34HdjowEsgN2fOH-lvWGFu-6hO07UBfq_rs6f"
+    }
+   ]
+  },
+  "copy@64000:no_tool": {
+   "items_sha256": "53d8d9dec2896cfcb4ec698b79c123ce41f836b122df29a7ebba69017b127bbf",
+   "exact": 1.0,
+   "mean_calls": 0.0,
+   "sample": "LJh8NoMtwh6c9eOnzxTBE8C4xJZwN9H_ZRl9CZgBrXJhEb8V5F1u1uPsHqIgtwaA",
+   "examples": [
+    {
+     "question": "Copy the token I gave you exactly.",
+     "answer": "LJh8NoMtwh6c9eOnzxTBE8C4xJZwN9H_ZRl9CZgBrXJhEb8V5F1u1uPsHqIgtwaA",
+     "exact": true,
+     "calls": 0,
+     "call_trace": [],
+     "reply": "LJh8NoMtwh6c9eOnzxTBE8C4xJZwN9H_ZRl9CZgBrXJhEb8V5F1u1uPsHqIgtwaA"
+    },
+    {
+     "question": "Copy the token I gave you exactly.",
+     "answer": "Mcy1yl4Ae0-uNONZjN7iUjrnY7p4bW8ELo6bAtLWMRYlGyzWoQNJ8Q5Wlnsmqwxy",
+     "exact": true,
+     "calls": 0,
+     "call_trace": [],
+     "reply": "Mcy1yl4Ae0-uNONZjN7iUjrnY7p4bW8ELo6bAtLWMRYlGyzWoQNJ8Q5Wlnsmqwxy"
+    },
+    {
+     "question": "Copy the token I gave you exactly.",
+     "answer": "jR2rAsX9Q0bZOFcHQyRN4nWAQLnuGMDTszzdzkrF",
+     "exact": true,
+     "calls": 0,
+     "call_trace": [],
+     "reply": "jR2rAsX9Q0bZOFcHQyRN4nWAQLnuGMDTszzdzkrF"
+    },
+    {
+     "question": "Copy the token I gave you exactly.",
+     "answer": "iHvQspaKUEUvxj6eZxrNWcuz",
+     "exact": true,
+     "calls": 0,
+     "call_trace": [],
+     "reply": "iHvQspaKUEUvxj6eZxrNWcuz"
+    },
+    {
+     "question": "Copy the token I gave you exactly.",
+     "answer": "QgesZ-n8S00K_703poQ31dPgL3WPNiFp5FYg8nENYEiV1vC1pjmqp6aLFMdPwi45",
+     "exact": true,
+     "calls": 0,
+     "call_trace": [],
+     "reply": "QgesZ-n8S00K_703poQ31dPgL3WPNiFp5FYg8nENYEiV1vC1pjmqp6aLFMdPwi45"
+    },
+    {
+     "question": "Copy the token I gave you exactly.",
+     "answer": "fNd6ONP-s8AzLhzOT8cwzEyg",
+     "exact": true,
+     "calls": 0,
+     "call_trace": [],
+     "reply": "fNd6ONP-s8AzLhzOT8cwzEyg"
+    },
+    {
+     "question": "Copy the token I gave you exactly.",
+     "answer": "rQ41kvCNpzIxELIVoDMxCJql7j4jfaKG2lvKyFwJdxte7Xa-hxiUP9eLwvo3E4GE",
+     "exact": true,
+     "calls": 0,
+     "call_trace": [],
+     "reply": "rQ41kvCNpzIxELIVoDMxCJql7j4jfaKG2lvKyFwJdxte7Xa-hxiUP9eLwvo3E4GE"
+    },
+    {
+     "question": "Copy the token I gave you exactly.",
+     "answer": "tc-34HdjowEsgN2fOH-lvWGFu-6hO07UBfq_rs6f",
+     "exact": true,
+     "calls": 0,
+     "call_trace": [],
+     "reply": "tc-34HdjowEsgN2fOH-lvWGFu-6hO07UBfq_rs6f"
+    }
+   ]
+  }
+ }
+}

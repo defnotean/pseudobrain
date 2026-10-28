@@ -1,0 +1,135 @@
+{
+  "tasks": {
+    "hellaswag": {
+      "n": 1000,
+      "acc": 0.569,
+      "acc_stderr": 0.015667944488173442,
+      "acc_norm": 0.739,
+      "acc_norm_stderr": 0.013895037677965183,
+      "data_sha256": "d5c08c3e5771307e73886dc9d2744df8ca5f372a7857f32fe77df8c58942f950",
+      "dataset": "Rowan/hellaswag",
+      "split": "validation",
+      "complete": false,
+      "seconds": 220.7
+    },
+    "piqa": {
+      "n": 1000,
+      "acc": 0.804,
+      "acc_stderr": 0.012559527926707345,
+      "acc_norm": 0.817,
+      "acc_norm_stderr": 0.012233587399477747,
+      "data_sha256": "61533005e22f175534909b1ec8eacb6da03c233933558d1bafb15787453b1f55",
+      "dataset": "baber/piqa",
+      "split": "validation",
+      "complete": false,
+      "seconds": 93.9
+    },
+    "arc_easy": {
+      "n": 1000,
+      "acc": 0.819,
+      "acc_stderr": 0.012181436179178029,
+      "acc_norm": 0.726,
+      "acc_norm_stderr": 0.01411109928825969,
+      "data_sha256": "874354cf372667530bd6cbd2d78dca2d657c5e2e746f53cf01d1e9d3a90cbc3d",
+      "dataset": "allenai/ai2_arc",
+      "split": "test",
+      "complete": false,
+      "seconds": 164.2
+    },
+    "arc_challenge": {
+      "n": 1000,
+      "acc": 0.579,
+      "acc_stderr": 0.015620595475301285,
+      "acc_norm": 0.581,
+      "acc_norm_stderr": 0.015610338967577953,
+      "data_sha256": "03227c30fd557ad1416c2cb955eeb6dc79eeb21e0679456a1ccd42eaccc0ff87",
+      "dataset": "allenai/ai2_arc",
+      "split": "test",
+      "complete": false,
+      "seconds": 185.5
+    },
+    "winogrande": {
+      "n": 1000,
+      "acc": 0.757,
+      "acc_stderr": 0.013569640199177542,
+      "data_sha256": "69f3d7f3a900d775339b04c7de672609c40fca573e50f594f2ae66d8782505be",
+      "dataset": "allenai/winogrande",
+      "split": "validation",
+      "complete": false,
+      "seconds": 56.2
+    },
+    "lambada": {
+      "n": 1000,
+      "acc": 0.725,
+      "acc_stderr": 0.014127086556490498,
+      "acc_strict": 0.725,
+      "ppl": 3.4600689348212894,
+      "mean_word_ll": -1.2412885122299195,
+      "word_bpb": 0.2671242214956063,
+      "data_sha256": "9acdcb12e8c2ef4eb3d0958b547a8c7076488df2d6ff460377881ab3841f3d97",
+      "dataset": "EleutherAI/lambada_openai",
+      "split": "test",
+      "complete": false,
+      "seconds": 91.3
+    },
+    "bpb": {
+      "all": 0.8795030985105247,
+      "web": 0.6681452099434283,
+      "wiki": 0.6714665745317224,
+      "books": 0.8145777415907451,
+      "stories": 0.8560933083274563,
+      "conversation": 2.4115052904868763,
+      "reading_comp": 0.6269031486651943,
+      "code": 0.31089929449266923,
+      "math": 1.005303734667596,
+      "synthetic_textbooks": 0.4477929465175939,
+      "seconds": 1689.6
+    },
+    "facts": {
+      "items": 143,
+      "closed_em": 0.972027972027972,
+      "closed_bpb": 0.17519021884745864,
+      "open_em": 0.993006993006993,
+      "open_bpb": 0.08343017495141128,
+      "seconds": 6.4
+    },
+    "squad": {
+      "items": 400,
+      "open_em": 0.1875,
+      "open_bpb": 0.6559649702179661,
+      "closed_em": 0.0,
+      "closed_bpb": 2.0303064448936303,
+      "seconds": 86.3
+    },
+    "speed": {
+      "prefill_tok_per_s_b1": 1345.7564313756127,
+      "prefill_tok_per_s_b16": 1465.3312135623491,
+      "eager_decode_tok_per_s_ctx1024": 3.9939079226464957,
+      "state_mb_ctx1024": 249.9375,
+      "eager_decode_tok_per_s_ctx32768": 1.7648709495496484,
+      "state_mb_ctx32768": 3225.9375,
+      "parameters": 26895998464,
+      "state_bytes_per_stream": null,
+      "seconds": 223.7
+    }
+  },
+  "model": "exact:Qwen/Qwen3.8-27B",
+  "name": "q38-teacher-battery",
+  "describe": {
+    "adapter": "hf",
+    "model_id": "exact:Qwen/Qwen3.8-27B",
+    "name": "q38-teacher-battery",
+    "revision": null,
+    "dtype": "bfloat16",
+    "device": "cuda",
+    "parameters": 26895998464,
+    "max_length": 8192,
+    "bpb_window": 2048,
+    "vocab": 248320,
+    "prefix_token_id": 248046,
+    "transformers": null,
+    "torch": "2.14.0+cu130",
+    "memory_fraction": null
+  },
+  "quant": null
+}

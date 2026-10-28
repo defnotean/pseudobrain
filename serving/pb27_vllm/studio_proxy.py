@@ -69,8 +69,7 @@ class Handler(BaseHTTPRequestHandler):
                 if isinstance(body, dict):
                     if "model" in body:
                         body["model"] = ARGS.model
-                    for key in ("pseudobrain_mode", "tools", "tool_choice"):  # old-server extras; Studio's tools are
-                        body.pop(key, None)                                    # described in its system prompt as XML
+                    body.pop("pseudobrain_mode", None)  # old-server extra rejected by vLLM; keep tools/tool_choice for OpenCode & Studio
                 raw = json.dumps(body).encode()
             except ValueError:
                 pass

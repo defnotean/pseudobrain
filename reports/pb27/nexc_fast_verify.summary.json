@@ -1,0 +1,55 @@
+{
+ "name": "PseudoBrain-Nex-35B-A3B-NVFP4-Fast",
+ "model": "pb27",
+ "seed": 2710,
+ "lengths": {
+  "8192": {
+   "needle": 1.0,
+   "multi4": 1.0,
+   "trace4": 1.0,
+   "probes": {
+    "needle@0.1": 1.0,
+    "needle@0.5": 1.0,
+    "needle@0.9": 1.0,
+    "multi4": 1.0,
+    "trace4": 1.0
+   },
+   "max_prompt_tokens": 8208,
+   "mean_ttft_s": 1.8,
+   "mean_decode_tok_s": 25.48,
+   "errors": 0
+  },
+  "120000": {
+   "needle": 1.0,
+   "multi4": 1.0,
+   "trace4": 1.0,
+   "probes": {
+    "needle@0.1": 1.0,
+    "needle@0.5": 1.0,
+    "needle@0.9": 1.0,
+    "multi4": 1.0,
+    "trace4": 1.0
+   },
+   "max_prompt_tokens": 116711,
+   "mean_ttft_s": 36.7,
+   "mean_decode_tok_s": 13.82,
+   "errors": 0
+  },
+  "250000": {
+   "needle": 1.0,
+   "multi4": 1.0,
+   "trace4": 1.0,
+   "probes": {
+    "needle@0.1": 1.0,
+    "needle@0.5": 1.0,
+    "needle@0.9": 1.0,
+    "multi4": 1.0,
+    "trace4": 1.0
+   },
+   "max_prompt_tokens": 244065,
+   "mean_ttft_s": 90.3,
+   "mean_decode_tok_s": 13.31,
+   "errors": 0
+  }
+ }
+}
