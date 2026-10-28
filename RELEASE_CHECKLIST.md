@@ -22,7 +22,7 @@
 - [x] Medium-hard Python coding benchmark (`33` problems × `2` samples): `reports/pb27/nexc_med.*`, `pb27c_med.*`.
 
 ## Write-up
-- [x] Technical report (`docs/PSEUDOBRAIN_ARCHITECTURE_PAPER.md` & `docs/REPORT.md`): method, conversion recipe, three-tier exact memory hierarchy, unrotated 2-hop bridge, bit-exact FA2 kernel fast paths, results tables, limitations.
+- [x] Technical report (`docs/PSEUDOBRAIN_ARCHITECTURE_PAPER.pdf`, `docs/PSEUDOBRAIN_ARCHITECTURE_PAPER.docx`, `docs/REPORT.pdf`, `docs/PSEUDOBRAIN_ARCHITECTURE_PAPER.md`): method, conversion recipe, three-tier exact memory hierarchy, unrotated 2-hop bridge, bit-exact FA2 kernel fast paths, results tables, limitations.
 - [x] `README.md` numbers filled in; limitations section honest (what is not better than stock).
 
 ## Go public
