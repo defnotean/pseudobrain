@@ -47,8 +47,8 @@ ORIGIN = SINKS if FAITHFUL else 0                                  # after the s
 QWIN = os.environ.get("PB27_MEMORY_QWIN", "") == "1"             # decode retrieval uses trailing verified query window
 DSTEP = os.environ.get("PB27_MEMORY_DSTEP", "") == "1"           # step-1 decode uses `blocks`; step-2+ decode uses `decode_blocks`
 SCALE = [int(x) for x in os.environ.get("PB27_MEMORY_SCALE", "2048:384:4096:512:8192:512").split(":") if x.strip()]
-ROPE_HORIZON = int(os.environ.get("PB27_MEMORY_ROPE_HORIZON", "262144") or 262144)
-ROPE_ARC_SPAN = int(os.environ.get("PB27_MEMORY_ROPE_ARC_SPAN", "16384") or 16384)
+ROPE_HORIZON = 262144
+ROPE_ARC_SPAN = 229376
 ROPE_THETA = float(os.environ.get("PB27_MEMORY_ROPE_THETA", "10000000.0") or 10000000.0)
 OFFLOAD = os.environ.get("PB27_MEMORY_OFFLOAD", "nvme").strip().lower()  # "", "cpu", "fp8", "cpu_fp8", or "nvme"
 # "nvme": fp8/bf16 K/V live in an unlinked sparse file mapped into memory (page cache is evictable, so resident memory
@@ -525,7 +525,6 @@ def _reposition_rope_blocks(
     block: int,
     ref_pos: int,
     contiguous_runs: bool = True,
-    span: int | None = None,
 ) -> torch.Tensor:
     """Compress archived-block rotary positions into `[ref_pos - ROPE_ARC_SPAN, ref_pos)` when `ref_pos > ROPE_HORIZON`.
 
@@ -545,24 +544,24 @@ def _reposition_rope_blocks(
     if half <= 0:
         return rk
     idx = blk_idx.to(device=rk.device, dtype=torch.long)
+    if contiguous_runs and n_blk > 1:
+        idx = idx.clone()
+        is_succ = torch.zeros_like(idx, dtype=torch.bool)
+        is_succ[:, 1:] = idx[:, 1:] == (idx[:, :-1] + 1)
+        step = 1
+        while step < n_blk:
+            prev_idx = torch.roll(idx, shifts=step, dims=1)
+            prev_succ = torch.roll(is_succ, shifts=step, dims=1)
+            prev_succ[:, :step] = False
+            idx = torch.where(is_succ, prev_idx, idx)
+            is_succ = is_succ & prev_succ
+            if not bool(is_succ.any()):
+                break
+            step *= 2
     orig_pos = (ORIGIN + idx * block).to(torch.float32)
-    end_pos = float(max(0, ref_pos - 2 * block))
-    if span == 0 or not contiguous_runs:
-        target_pos = torch.full_like(orig_pos, end_pos)
-    else:
-        if n_blk > 1:
-            diff = idx[:, 1:] - idx[:, :-1]
-            step = torch.where(
-                diff <= 0,
-                torch.zeros_like(diff),
-                torch.where(diff == 1, torch.full_like(diff, block), torch.full_like(diff, 2 * block)),
-            )
-            rel_from_end = torch.zeros_like(idx)
-            rel_from_end[:, :-1] = torch.cumsum(step.flip(1), dim=1).flip(1)
-        else:
-            rel_from_end = torch.zeros_like(idx)
-        target_pos = (end_pos - rel_from_end.to(torch.float32)).clamp(min=0.0)
-    delta = target_pos - orig_pos
+    scale = 1.0 - min(1.0, float(ROPE_ARC_SPAN) / float(max(1, ref_pos)))
+    max_shift = (float(max(0, ref_pos - 2 * block)) - orig_pos).clamp(min=0.0)
+    delta = torch.minimum(torch.round((float(ref_pos) - orig_pos).clamp(min=0.0) * scale), max_shift)
     inv_freq = _get_rope_inv_freq(rk.device, d_rot)
     angles = delta.unsqueeze(-1) * inv_freq
     cos = angles.cos().unsqueeze(2)
@@ -576,28 +575,6 @@ def _reposition_rope_blocks(
     out[..., :half] = r1
     out[..., half:d_rot] = r2
     return out.view(kv, total_t, d)
-
-
-def _reposition_rope_sinks(sk: torch.Tensor, block: int, ref_pos: int) -> torch.Tensor:
-    """Shift the `ns` sink tokens `0..ns-1` to `ref_pos - 65536 - block + (0..ns-1)` when `ref_pos > ROPE_HORIZON`."""
-    if ROPE_HORIZON <= 0 or ref_pos <= ROPE_HORIZON or sk.numel() == 0:
-        return sk
-    d = sk.shape[-1]
-    d_rot = d // 4
-    half = d_rot // 2
-    if half <= 0:
-        return sk
-    shift = float(max(0, ref_pos - 65536 - block))
-    inv_freq = _get_rope_inv_freq(sk.device, d_rot)
-    angles = shift * inv_freq
-    cos = angles.cos().view(1, 1, half)
-    sin = angles.sin().view(1, 1, half)
-    x1 = sk[..., :half].float()
-    x2 = sk[..., half:d_rot].float()
-    out = sk.clone()
-    out[..., :half] = (x1 * cos - x2 * sin).to(sk.dtype)
-    out[..., half:d_rot] = (x2 * cos + x1 * sin).to(sk.dtype)
-    return out
 
 
 def _gather_blocks(t: torch.Tensor, blk_idx: torch.Tensor, block: int) -> torch.Tensor:
@@ -747,8 +724,6 @@ def retrieve_blocks(arc: Archive, q: torch.Tensor, groups: int, limit: int, rera
         cand = score.topk(c, dim=-1).indices                                              # [KV, c]
         ck_raw = _gather_blocks(arc.keys, cand, block).to(device=q.device)
         ck = ck_raw.float()
-        if ROPE_HORIZON > 0 and limit > ROPE_HORIZON:
-            ck = _reposition_rope_blocks(ck, cand, block, limit, contiguous_runs=False, span=0)
         exact = torch.einsum("gqd,gnd->gqn", qg, ck).amax(1).view(kv, c, block).amax(-1)
         keep = exact.topk(k, dim=-1).indices
         top = cand.gather(-1, keep)
@@ -1028,7 +1003,7 @@ def retrieve_blocks_per_token(arc: Archive, q: torch.Tensor, groups: int, limit:
             cand_part = cand[:, c_s:c_e]
             ck_part = _gather_blocks(arc.keys, cand_part, block).to(device=q.device, dtype=torch.float32)
             if ROPE_HORIZON > 0 and ref_pos > ROPE_HORIZON:
-                ck_part = _reposition_rope_blocks(ck_part, cand_part, block, ref_pos, contiguous_runs=False, span=0)
+                ck_part = _reposition_rope_blocks(ck_part, cand_part, block, ref_pos, contiguous_runs=False)
             ex_part = torch.bmm(qg, ck_part.transpose(-1, -2)).view(kv, groups, t_ev, c_e - c_s, block).amax(-1).amax(1)
             exact_parts.append(ex_part)
         exact = torch.cat(exact_parts, dim=-1) if len(exact_parts) > 1 else exact_parts[0]
@@ -1168,7 +1143,6 @@ def piece_attention(arc: Archive, q: torch.Tensor, q_pos: torch.Tensor, top: tor
                     else:
                         sk_t = arc.keys[:, :ns].to(device=q.device, dtype=q.dtype).transpose(0, 1)
                         sv_t = arc.values[:, :ns].to(device=q.device, dtype=q.dtype).transpose(0, 1)
-                    sk_t = _reposition_rope_sinks(sk_t, block, ref_pos)
                     pre_k = torch.cat((sk_t, rk.transpose(0, 1)), dim=0)
                     pre_v = torch.cat((sv_t, rv.transpose(0, 1)), dim=0)
                 else:
@@ -1202,13 +1176,11 @@ def piece_attention(arc: Archive, q: torch.Tensor, q_pos: torch.Tensor, top: tor
     ref_pos = lo
     if ns > 0:
         if arc.sink_k is not None and ns <= arc.sink_k.shape[0]:
-            sk = arc.sink_k[:ns].transpose(0, 1).to(dtype=q.dtype)
-            sv = arc.sink_v[:ns].transpose(0, 1).to(dtype=q.dtype)
+            parts_k.append(arc.sink_k[:ns].transpose(0, 1).to(dtype=q.dtype))
+            parts_v.append(arc.sink_v[:ns].transpose(0, 1).to(dtype=q.dtype))
         else:
-            sk = arc.keys[:, :ns].to(device=q.device).to(dtype=q.dtype)
-            sv = arc.values[:, :ns].to(device=q.device).to(dtype=q.dtype)
-        parts_k.append(_reposition_rope_sinks(sk, block, ref_pos))
-        parts_v.append(sv)
+            parts_k.append(arc.keys[:, :ns].to(device=q.device).to(dtype=q.dtype))
+            parts_v.append(arc.values[:, :ns].to(device=q.device).to(dtype=q.dtype))
         if need_mask:
             parts_allow.append(torch.ones(t, ns, dtype=torch.bool, device=q.device))
     if top is not None:
