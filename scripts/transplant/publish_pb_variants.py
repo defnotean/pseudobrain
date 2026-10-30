@@ -113,39 +113,6 @@ VARIANTS = {
         "readme_path": "/home/defnotean/pb27/release/flash_next/README.md",
         "old_repo_str": "PseudoBrain-Qwen3.8-Flash-Next-NVFP4",
     },
-    # 4. PseudoBrain-Nanbeige4.3-33B (nanbeige)
-    "nanbeige-bf16": {
-        "target_repo": "defnoteatin/PseudoBrain-Nanbeige4.3-33B-BF16",
-        "base_repo": "Nanbeige/Nanbeige4.3-33B",
-        "slim_dir": "/home/defnotean/pb27/hf/nanbeige",
-        "gdn_ckpt_path": "nanbeige/pb27-gdn-00001-of-00001.safetensors",
-        "readme_path": "/home/defnotean/pb27/release/nanbeige/README.md",
-        "old_repo_str": "PseudoBrain-Nanbeige4.3-33B-W4A16",
-    },
-    "nanbeige-nvfp4": {
-        "target_repo": "defnoteatin/PseudoBrain-Nanbeige4.3-33B-NVFP4",
-        "base_repo": "webbrain-one/Nanbeige4.3-33B-NVFP4",
-        "slim_dir": "/home/defnotean/pb27/hf/nanbeige",
-        "gdn_ckpt_path": "nanbeige/pb27-gdn-00001-of-00001.safetensors",
-        "readme_path": "/home/defnotean/pb27/release/nanbeige/README.md",
-        "old_repo_str": "PseudoBrain-Nanbeige4.3-33B-W4A16",
-    },
-    "nanbeige-w4a16": {
-        "target_repo": "defnoteatin/PseudoBrain-Nanbeige4.3-33B-W4A16",
-        "base_repo": "cyankiwi/Nanbeige4.3-33B-AWQ-INT4",
-        "slim_dir": "/home/defnotean/pb27/hf/nanbeige",
-        "gdn_ckpt_path": "nanbeige/pb27-gdn-00001-of-00001.safetensors",
-        "readme_path": "/home/defnotean/pb27/release/nanbeige/README.md",
-        "old_repo_str": "PseudoBrain-Nanbeige4.3-33B-W4A16",
-    },
-    "nanbeige-fp8": {
-        "target_repo": "defnoteatin/PseudoBrain-Nanbeige4.3-33B-FP8",
-        "base_repo": "primitive-ai/Nanbeige4.3-33B-FP8",
-        "slim_dir": "/home/defnotean/pb27/hf/nanbeige",
-        "gdn_ckpt_path": "nanbeige/pb27-gdn-00001-of-00001.safetensors",
-        "readme_path": "/home/defnotean/pb27/release/nanbeige/README.md",
-        "old_repo_str": "PseudoBrain-Nanbeige4.3-33B-W4A16",
-    },
 }
 
 

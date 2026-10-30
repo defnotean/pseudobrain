@@ -28,7 +28,7 @@ tags:
 - **BF16 (Universal NVIDIA & AMD ROCm):** [`defnoteatin/PseudoBrain-Qwen3.8-Flash-Next-BF16`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3.8-Flash-Next-BF16)
 
 **Speculative Draft Model (`DFlash2`):** [`incoai/Qwen3.8-Flash-Next-DFlash2`](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2)  
-**Companion Model Families:** [`PseudoBrain-Nex-35B-A3B`](https://huggingface.co/defnoteatin/PseudoBrain-Nex-35B-A3B-NVFP4) | [`PseudoBrain-27B`](https://huggingface.co/defnoteatin/PseudoBrain-27B-NVFP4) | [`PseudoBrain-Nanbeige4.3-33B`](https://huggingface.co/defnoteatin/PseudoBrain-Nanbeige4.3-33B-W4A16)  
+**Companion Model Families:** [`PseudoBrain-Nex-35B-A3B`](https://huggingface.co/defnoteatin/PseudoBrain-Nex-35B-A3B-NVFP4) | [`PseudoBrain-27B`](https://huggingface.co/defnoteatin/PseudoBrain-27B-NVFP4)  
 **Architecture Paper:** [`docs/PSEUDOBRAIN_ARCHITECTURE_PAPER.md`](https://github.com/defnotean/pseudobrain/blob/main/docs/PSEUDOBRAIN_ARCHITECTURE_PAPER.md)
 
 ## Overview
