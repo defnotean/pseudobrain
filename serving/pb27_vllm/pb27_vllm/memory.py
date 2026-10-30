@@ -143,6 +143,7 @@ class Archive:
     cached_ns: int = -1                     # cached sink count in cached_pre_k / cached_pre_v
     cached_pre_k: torch.Tensor | None = None  # [ns + k*B, KV, D] FA2-ready pre_k cached on GPU
     cached_pre_v: torch.Tensor | None = None  # [ns + k*B, KV, D] FA2-ready pre_v cached on GPU
+    last_prio_rank: torch.Tensor | None = None  # [KV, k] priority rank of each block in sorted `top`
     cached_cu: tuple | None = None          # (t, w_len, p_len, cu_q, cu_w, cu_p) cached int32 cu_seqlens on GPU
     smax: torch.Tensor | None = None        # [KV, (cap // block + SBLK - 1) // SBLK, D] coarse bf16 super-block max
     smin: torch.Tensor | None = None        # [KV, (cap // block + SBLK - 1) // SBLK, D] coarse bf16 super-block min
@@ -554,6 +555,7 @@ def _reposition_rope_blocks(
     ref_pos: int,
     contiguous_runs: bool = True,
     span: int | None = None,
+    prio_rank: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compress archived-block rotary positions into `[ref_pos - ROPE_ARC_SPAN, ref_pos)` when `ref_pos > ROPE_HORIZON`.
 
@@ -577,6 +579,9 @@ def _reposition_rope_blocks(
     if contiguous_runs and arc_span > 0 and n_blk > 1:
         is_succ = torch.zeros_like(idx, dtype=torch.bool)
         is_succ[:, 1:] = idx[:, 1:] == (idx[:, :-1] + 1)
+        if prio_rank is not None and prio_rank.shape == idx.shape:
+            pr = prio_rank.to(device=idx.device)
+            is_succ[:, 1:] = is_succ[:, 1:] & ((pr[:, 1:] > pr[:, :-1]) | (pr[:, :-1] < 128))
         step = 1
         while step < n_blk:
             prev_idx = torch.cat((idx[:, :step], idx[:, :-step]), dim=1)
@@ -958,6 +963,8 @@ def retrieve_blocks_per_token(arc: Archive, q: torch.Tensor, groups: int, limit:
             d_merged = torch.cat((d_inter, blk_ord[:, k_d:]), dim=-1) if k_d < blk_ord.shape[1] else d_inter
             blk_ord = _dedup_priority(d_merged, k_sel)
         arc.decode_top = blk_ord
+        if kv > 1:
+            blk_ord = _dedup_priority(blk_ord.transpose(0, 1).reshape(1, -1), k_sel).expand(kv, -1).contiguous()
         dec_prio, dec_sorted = _expand_successors_dedup(blk_ord, full, k_sel, m_succ=k_sel)
         if arc.prompt_top is not None:
             p_prev = arc.prompt_top.clamp(max=full - 1)
@@ -965,8 +972,9 @@ def retrieve_blocks_per_token(arc: Archive, q: torch.Tensor, groups: int, limit:
             n_pin = max(0, k_out - dec_prio.shape[1])
             merged = torch.cat((p_prev[:, :n_pin], dec_prio, p_prev[:, n_pin:]), dim=-1)
             top_prio = _dedup_priority(merged, k_out)
-            blk = top_prio.sort(-1).values
+            blk, arc.last_prio_rank = top_prio.sort(-1)
         else:
+            _, arc.last_prio_rank = dec_prio.sort(-1)
             blk = dec_sorted
         STATS["retrievals"] += 1
         STATS["pertoken"] += 1
@@ -983,9 +991,10 @@ def retrieve_blocks_per_token(arc: Archive, q: torch.Tensor, groups: int, limit:
     for s_thresh, s_blocks in zip(SCALE[0::2], SCALE[1::2]):
         if n_arch > s_thresh:
             budget = max(budget, s_blocks)
-    k = min(max(budget, 1024 if n_arch > 8192 else (512 if n_arch > 4096 else (384 if n_arch > 2048 else budget))), n_valid)
-    rerank_pool = max(MEMORY["rerank"], 2 * k) if MEMORY["rerank"] > 0 else 0
-    c0 = min(max(rerank_pool, k), n_valid)
+    k_cand = min(max(budget, 1024 if n_arch > 8192 else (512 if n_arch > 4096 else (384 if n_arch > 2048 else budget))), n_valid)
+    k = min(k_cand, 512)
+    rerank_pool = max(MEMORY["rerank"], 2 * k_cand) if MEMORY["rerank"] > 0 else 0
+    c0 = min(max(rerank_pool, k_cand), n_valid)
     cand_mult = max(PERTOKEN_CAND, 2) if (lead is not None or t_ev > 1) else max(PERTOKEN_CAND, 1)
     if lead == 0 and arc.decode_step > 2 and arc.prompt_top is not None:
         c = min(max(k, 768), n_valid)
@@ -1003,7 +1012,7 @@ def retrieve_blocks_per_token(arc: Archive, q: torch.Tensor, groups: int, limit:
     ranks = _ranks(score)                                                              # [KV, T_eval, full]
     r_tier = ranks.amin(1) * full + _ranks(score.amax(1))                              # [KV, full]
     if lead is not None and lead < 0 and t_ev > 36:
-        t_tail = min(t_ev, 96)
+        t_tail = min(t_ev, 256)
         r_tail = ranks[:, -t_tail:].amin(1) * full + _ranks(score[:, -t_tail:].amax(1))
         r_z_rel = _ranks(z_score_rel[:, -t_tail:].amax(1))
         r_z_raw = _ranks(z_score_raw[:, -t_tail:].amax(1))
@@ -1049,7 +1058,7 @@ def retrieve_blocks_per_token(arc: Archive, q: torch.Tensor, groups: int, limit:
     er = _ranks(exact)                                                                 # [KV, T_eval, c]
     e_tier = er.amin(1) * c + _ranks(exact.amax(1))                                    # [KV, c]
     if lead is not None and lead < 0 and t_ev > 36:
-        t_tail = min(t_ev, 96)
+        t_tail = min(t_ev, 256)
         e_tail = er[:, -t_tail:].amin(1) * c + _ranks(exact[:, -t_tail:].amax(1))
         e_z_rel = _ranks(z_exact_rel[:, -t_tail:].amax(1))
         e_z_raw = _ranks(z_exact_raw[:, -t_tail:].amax(1))
@@ -1103,17 +1112,13 @@ def retrieve_blocks_per_token(arc: Archive, q: torch.Tensor, groups: int, limit:
         merged_ord = _dedup_priority(merged, k)
     else:
         merged_ord = blk_ord
+    if kv > 1:
+        merged_ord = _dedup_priority(merged_ord.transpose(0, 1).reshape(1, -1), k).expand(kv, -1).contiguous()
     m_succ = min(640, k) if k > 1024 else k
-    top_prio, blk = _expand_successors_dedup(merged_ord, full, k, m_succ=m_succ)
+    top_prio, _ = _expand_successors_dedup(merged_ord, full, k, m_succ=m_succ)
+    blk, arc.last_prio_rank = top_prio.sort(-1)
     if lead is not None and lead < 0:
         arc.prompt_top = top_prio
-        if limit > 800000:
-            try:
-                import json
-                with open("/root/.cache/vllm/last_retrieve_1m.jsonl", "a") as _f:
-                    _f.write(json.dumps({"limit": int(limit), "k": int(k), "top32_kv0": top_prio[0, :32].tolist(), "top32_kv1": top_prio[-1, :32].tolist(), "blk_kv0": blk[0].tolist(), "blk_kv1": blk[-1].tolist()}) + "\n")
-            except Exception:
-                pass
     STATS["retrievals"] += 1
     STATS["pertoken"] += 1
     return blk, None
@@ -1174,7 +1179,7 @@ def piece_attention(arc: Archive, q: torch.Tensor, q_pos: torch.Tensor, top: tor
                 arc.cached_rk = rk_raw
                 arc.cached_rv = rv
                 ref_pos = lo
-                rk = _reposition_rope_blocks(rk_raw, top, block, ref_pos, contiguous_runs=True)
+                rk = _reposition_rope_blocks(rk_raw, top, block, ref_pos, contiguous_runs=True, prio_rank=arc.last_prio_rank)
                 if ns > 0:
                     if arc.sink_k is not None and ns <= arc.sink_k.shape[0]:
                         sk_kv = arc.sink_k[:ns].transpose(0, 1).to(dtype=q.dtype)
@@ -1231,7 +1236,7 @@ def piece_attention(arc: Archive, q: torch.Tensor, q_pos: torch.Tensor, top: tor
             rk_raw = _gather_blocks(arc.keys, top, block).to(device=q.device).to(dtype=q.dtype)       # [KV, R, D]
         arc.last_top = arc.last_rk = None
         rv = _gather_blocks(arc.values, top, block).to(device=q.device).to(dtype=q.dtype)
-        rk = _reposition_rope_blocks(rk_raw, top, block, ref_pos, contiguous_runs=True)
+        rk = _reposition_rope_blocks(rk_raw, top, block, ref_pos, contiguous_runs=True, prio_rank=arc.last_prio_rank)
         parts_k.append(rk); parts_v.append(rv)
         if own is None and arc.prompt_top is not None:
             arc.cached_top = top
@@ -1506,7 +1511,7 @@ def windowed_attention_with_memory(attn_module, q: torch.Tensor, k: torch.Tensor
         # pieces are aligned to the END of the chunk, so the last piece is always a full window of the most recent
         # tokens (the question) instead of a remainder of a few tokens
         bounds = [(max(s, p1 - piece), p1) for p1 in range(e, s, -piece)]
-        q_piece = max(piece, 160)
+        q_piece = max(piece, 384)
         if is_prefill and PREFILL == "pt":
             # Keep vLLM's clean shift-invariant sliding-window output for haystack chunks and run exact rescoring
             # retrieval + piece_attention only on the final question piece `(cut, e)` at the end of the prompt.
