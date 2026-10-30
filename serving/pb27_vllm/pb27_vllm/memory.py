@@ -531,14 +531,74 @@ def retrieve_blocks(arc: Archive, q: torch.Tensor, groups: int, limit: int, rera
     arc.refresh_bounds(block)
     t, h, d = q.shape
     kv = h // groups
+    n_valid = full
+    hole_b0 = hole_b1 = 0
+    if arc.hole_hi > arc.hole_lo:
+        hole_b0 = max(0, arc.hole_lo - ORIGIN) // block
+        hole_b1 = min(full, (arc.hole_hi - ORIGIN + block - 1) // block)
+        if hole_b1 > hole_b0:
+            n_valid = full - (hole_b1 - hole_b0)
+        if n_valid <= 0:
+            return None
+    if not budget:
+        budget = MEMORY["decode_blocks"] if (rerank and MEMORY["decode_blocks"]) else MEMORY["blocks"]
+    in_prompt_mid = not rerank and limit + MEMORY["window"] < arc.prompt_len
+    if not in_prompt_mid:
+        n_arch = max(full, (arc.prompt_len - MEMORY["window"] - ORIGIN) // block)
+        for s_thresh, s_blocks in zip(SCALE[0::2], SCALE[1::2]):
+            if n_arch > s_thresh:
+                budget = max(budget, s_blocks)
+    k = min(budget, n_valid)
+    rerank_pool = max(MEMORY["rerank"], 2 * budget) if MEMORY["rerank"] > 0 else 0
     qg = None
     if ORACLE:
         qg = q.float().permute(1, 0, 2).reshape(kv, groups * t, d)                         # [KV, G*T, D]
         score = oracle_block_mass(arc, qg, full, block)
+        if hole_b1 > hole_b0:
+            score[:, hole_b0:hole_b1] = float("-inf")
     else:
         s_dtype = q.dtype if (q.is_cuda and q.dtype in (torch.bfloat16, torch.float16)) else torch.float32
         qg_s = q.to(s_dtype).permute(1, 0, 2).reshape(kv, groups * t, d)
         pos, neg = qg_s.clamp(min=0), qg_s.clamp(max=0)
+        if not rerank and SBLK > 1 and arc.smax is not None and arc.smin is not None and full > SBLK * 16:
+            n_sb = (full + SBLK - 1) // SBLK
+            smax_t = arc.smax[:, :n_sb].to(s_dtype).transpose(-1, -2)
+            smin_t = arc.smin[:, :n_sb].to(s_dtype).transpose(-1, -2)
+            if pos.shape[1] <= 2048:
+                sb_score = (pos @ smax_t + neg @ smin_t).amax(1).float()
+            else:
+                sb_score = torch.full((kv, n_sb), float("-inf"), device=q.device, dtype=s_dtype)
+                for c0 in range(0, pos.shape[1], 2048):
+                    s_c = (pos[:, c0:c0 + 2048] @ smax_t + neg[:, c0:c0 + 2048] @ smin_t).amax(1)
+                    sb_score = torch.maximum(sb_score, s_c)
+                sb_score = sb_score.float()
+            m_sb = min(max(16, (2 * k + SBLK - 1) // SBLK), n_sb)
+            top_sb = sb_score.topk(m_sb, dim=-1).indices
+            sb_off = torch.arange(SBLK, device=q.device, dtype=top_sb.dtype)
+            fine_raw = (top_sb.unsqueeze(-1) * SBLK + sb_off).reshape(kv, m_sb * SBLK)
+            fine_valid = fine_raw < full
+            fine_idx = fine_raw.clamp(max=full - 1)
+            idx_d = fine_idx.unsqueeze(-1).expand(kv, m_sb * SBLK, d)
+            kmax_t = arc.kmax[:, :full].gather(1, idx_d).to(s_dtype).transpose(-1, -2)
+            kmin_t = arc.kmin[:, :full].gather(1, idx_d).to(s_dtype).transpose(-1, -2)
+            if pos.shape[1] <= 2048:
+                sub_score = (pos @ kmax_t + neg @ kmin_t).amax(1).float()
+            else:
+                sub_score = torch.full((kv, m_sb * SBLK), float("-inf"), device=q.device, dtype=s_dtype)
+                for c0 in range(0, pos.shape[1], 2048):
+                    s_c = (pos[:, c0:c0 + 2048] @ kmax_t + neg[:, c0:c0 + 2048] @ kmin_t).amax(1)
+                    sub_score = torch.maximum(sub_score, s_c)
+                sub_score = sub_score.float()
+            sub_score = sub_score.masked_fill(~fine_valid, float("-inf"))
+            if hole_b1 > hole_b0:
+                in_hole = (fine_idx >= hole_b0) & (fine_idx < hole_b1)
+                sub_score = sub_score.masked_fill(in_hole, float("-inf"))
+            arc.last_top = arc.last_rk = None
+            top = fine_idx.gather(-1, sub_score.topk(min(k, m_sb * SBLK), dim=-1).indices)
+            if MEMORY["neighbors"]:
+                top = torch.cat([top] + [(top + j).clamp(max=full - 1) for j in range(1, MEMORY["neighbors"] + 1)], dim=-1)
+            STATS["retrievals"] += 1
+            return top.sort(-1).values
         kmax_t = arc.kmax[:, :full].to(s_dtype).transpose(-1, -2)
         kmin_t = arc.kmin[:, :full].to(s_dtype).transpose(-1, -2)
         if pos.shape[1] <= 2048:
@@ -549,24 +609,8 @@ def retrieve_blocks(arc: Archive, q: torch.Tensor, groups: int, limit: int, rera
                 s_c = (pos[:, c0:c0 + 2048] @ kmax_t + neg[:, c0:c0 + 2048] @ kmin_t).amax(1)
                 score = torch.maximum(score, s_c)
             score = score.float()
-    n_valid = full
-    if arc.hole_hi > arc.hole_lo:
-        b0 = max(0, arc.hole_lo - ORIGIN) // block
-        b1 = min(full, (arc.hole_hi - ORIGIN + block - 1) // block)
-        if b1 > b0:
-            score[:, b0:b1] = float("-inf")
-            n_valid = full - (b1 - b0)
-        if n_valid <= 0:
-            return None
-    if not budget:
-        budget = MEMORY["decode_blocks"] if (rerank and MEMORY["decode_blocks"]) else MEMORY["blocks"]
-    in_prompt_mid = not rerank and limit + MEMORY["window"] < arc.prompt_len
-    n_arch = full if in_prompt_mid else max(full, (arc.prompt_len - MEMORY["window"] - ORIGIN) // block)
-    for s_thresh, s_blocks in zip(SCALE[0::2], SCALE[1::2]):
-        if n_arch > s_thresh:
-            budget = max(budget, s_blocks)
-    k = min(budget, n_valid)
-    rerank_pool = max(MEMORY["rerank"], 2 * budget) if MEMORY["rerank"] > 0 else 0
+        if hole_b1 > hole_b0:
+            score[:, hole_b0:hole_b1] = float("-inf")
     arc.last_top = arc.last_rk = None
     if rerank and rerank_pool > k and not ORACLE:
         if qg is None:
