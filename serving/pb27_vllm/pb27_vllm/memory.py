@@ -30,8 +30,8 @@ except Exception:
 
 log = logging.getLogger("vllm")
 
-MEMORY: dict = {"enabled": True, "blocks": 256, "block_size": 64, "decode_blocks": 256, "neighbors": 0, "rerank": 512,
-                "chunk": 64, "window": int(os.environ.get("PB27_WINDOW", "16384"))}
+MEMORY: dict = globals().get("MEMORY", {"enabled": True, "blocks": 256, "block_size": 64, "decode_blocks": 256, "neighbors": 0, "rerank": 512,
+                "chunk": 64, "window": int(os.environ.get("PB27_WINDOW", "16384"))})
 DEBUG = os.environ.get("PB27_MEMORY_DEBUG", "") == "1"
 NORETRIEVE = os.environ.get("PB27_MEMORY_NORETRIEVE", "") == "1"   # diagnostic: recompute pieces from the archive without retrieval
 SINKS = int(os.environ.get("PB27_MEMORY_SINKS", "4") or 0)         # PB-27 was trained with 4 always-visible sink positions; vLLM
@@ -48,7 +48,7 @@ QWIN = os.environ.get("PB27_MEMORY_QWIN", "") == "1"             # decode retrie
 DSTEP = os.environ.get("PB27_MEMORY_DSTEP", "") == "1"           # step-1 decode uses `blocks`; step-2+ decode uses `decode_blocks`
 SCALE = [int(x) for x in os.environ.get("PB27_MEMORY_SCALE", "2048:384:4096:512:8192:512").split(":") if x.strip()]
 ROPE_HORIZON = int(os.environ.get("PB27_MEMORY_ROPE_HORIZON", "262144") or 262144)
-ROPE_ARC_SPAN = int(os.environ.get("PB27_MEMORY_ROPE_ARC_SPAN", "98304") or 98304)
+ROPE_ARC_SPAN = int(os.environ.get("PB27_MEMORY_ROPE_ARC_SPAN", "16384") or 16384)
 ROPE_THETA = float(os.environ.get("PB27_MEMORY_ROPE_THETA", "10000000.0") or 10000000.0)
 OFFLOAD = os.environ.get("PB27_MEMORY_OFFLOAD", "nvme").strip().lower()  # "", "cpu", "fp8", "cpu_fp8", or "nvme"
 # "nvme": fp8/bf16 K/V live in an unlinked sparse file mapped into memory (page cache is evictable, so resident memory
@@ -83,17 +83,18 @@ QBUF_CAP = 256
 GPU_WIN_CAP = 32768
 LSE = os.environ.get("PB27_MEMORY_LSE", "1") != "0"               # FlashAttention-2 LSE-merge fast path for piece_attention
 RERANK_ALL = os.environ.get("PB27_MEMORY_RERANK_ALL", "1") != "0"  # exact rescoring for every piece, not only decode
-BATCH: dict = {"ib": None, "pos_list": None}     # the runner's current InputBatch (req_ids, query_start_loc, ...)
-PROMPT_LENS: dict[str, int] = {}                 # req_id -> initial prompt_len from RequestState.add_request
-ARCHIVES: dict[tuple[str, str], "Archive"] = {}  # (req_id, layer_name) -> Archive
-STATS: dict = {"calls": 0, "fallback": 0, "retrievals": 0, "pieces": 0, "tokens_archived": 0,
+BATCH: dict = globals().get("BATCH", {"ib": None, "pos_list": None})     # the runner's current InputBatch (req_ids, query_start_loc, ...)
+PROMPT_LENS: dict[str, int] = globals().get("PROMPT_LENS", {})           # req_id -> initial prompt_len from RequestState.add_request
+ARCHIVES: dict[tuple[str, str], "Archive"] = globals().get("ARCHIVES", {})  # (req_id, layer_name) -> Archive
+STATS: dict = globals().get("STATS", {"calls": 0, "fallback": 0, "retrievals": 0, "pieces": 0, "tokens_archived": 0,
                "adopt_full": 0, "adopt_partial": 0, "adopt_none": 0, "hole_skips": 0,
-               "pertoken": 0, "pertoken_capped": 0}
+               "pertoken": 0, "pertoken_capped": 0})
 # Prefix caching: vLLM skips computing the cached prefix of a new request, so the archive of the request that
 # produced that prefix is retained after it finishes and adopted by the next request whose tokens match it.
 RETAIN = int(os.environ.get("PB27_MEMORY_RETAIN", "0") or 0)   # max retired archive sets kept (0 = off)
-RETIRED: list[dict] = []        # [{"tokens": int32 tensor of the finished request, "archives": {layer: Archive}}]
-ADOPTED: dict[str, tuple] = {}  # req_id -> (archives by layer, hole_lo, hole_hi, num_computed)
+RETIRED: list[dict] = globals().get("RETIRED", [])        # [{"tokens": int32 tensor of the finished request, "archives": {layer: Archive}}]
+ADOPTED: dict[str, tuple] = globals().get("ADOPTED", {})  # req_id -> (archives by layer, hole_lo, hole_hi, num_computed)
+_MTIME: float = os.path.getmtime(__file__) if os.path.exists(__file__) else 0.0
 
 
 def configure_from_env() -> None:
@@ -524,6 +525,7 @@ def _reposition_rope_blocks(
     block: int,
     ref_pos: int,
     contiguous_runs: bool = True,
+    span: int | None = None,
 ) -> torch.Tensor:
     """Compress archived-block rotary positions into `[ref_pos - ROPE_ARC_SPAN, ref_pos)` when `ref_pos > ROPE_HORIZON`.
 
@@ -558,7 +560,8 @@ def _reposition_rope_blocks(
                 break
             step *= 2
     orig_pos = (ORIGIN + idx * block).to(torch.float32)
-    scale = 1.0 - min(1.0, float(ROPE_ARC_SPAN) / float(max(1, ref_pos)))
+    arc_span = ROPE_ARC_SPAN if span is None else span
+    scale = 1.0 - min(1.0, float(arc_span) / float(max(1, ref_pos)))
     max_shift = (float(max(0, ref_pos - 2 * block)) - orig_pos).clamp(min=0.0)
     delta = torch.minimum(torch.round((float(ref_pos) - orig_pos).clamp(min=0.0) * scale), max_shift)
     inv_freq = _get_rope_inv_freq(rk.device, d_rot)
@@ -574,6 +577,28 @@ def _reposition_rope_blocks(
     out[..., :half] = r1
     out[..., half:d_rot] = r2
     return out.view(kv, total_t, d)
+
+
+def _reposition_rope_sinks(sk: torch.Tensor, block: int, ref_pos: int) -> torch.Tensor:
+    """Shift the `ns` sink tokens `0..ns-1` to `ref_pos - ROPE_ARC_SPAN - block + (0..ns-1)` when `ref_pos > ROPE_HORIZON`."""
+    if ROPE_HORIZON <= 0 or ref_pos <= ROPE_HORIZON or sk.numel() == 0:
+        return sk
+    d = sk.shape[-1]
+    d_rot = d // 4
+    half = d_rot // 2
+    if half <= 0:
+        return sk
+    shift = float(max(0, ref_pos - ROPE_ARC_SPAN - block))
+    inv_freq = _get_rope_inv_freq(sk.device, d_rot)
+    angles = shift * inv_freq
+    cos = angles.cos().view(1, 1, half)
+    sin = angles.sin().view(1, 1, half)
+    x1 = sk[..., :half].float()
+    x2 = sk[..., half:d_rot].float()
+    out = sk.clone()
+    out[..., :half] = (x1 * cos - x2 * sin).to(sk.dtype)
+    out[..., half:d_rot] = (x2 * cos + x1 * sin).to(sk.dtype)
+    return out
 
 
 def _gather_blocks(t: torch.Tensor, blk_idx: torch.Tensor, block: int) -> torch.Tensor:
@@ -723,6 +748,8 @@ def retrieve_blocks(arc: Archive, q: torch.Tensor, groups: int, limit: int, rera
         cand = score.topk(c, dim=-1).indices                                              # [KV, c]
         ck_raw = _gather_blocks(arc.keys, cand, block).to(device=q.device)
         ck = ck_raw.float()
+        if ROPE_HORIZON > 0 and limit > ROPE_HORIZON:
+            ck = _reposition_rope_blocks(ck, cand, block, limit, contiguous_runs=False, span=0)
         exact = torch.einsum("gqd,gnd->gqn", qg, ck).amax(1).view(kv, c, block).amax(-1)
         keep = exact.topk(k, dim=-1).indices
         top = cand.gather(-1, keep)
@@ -848,7 +875,7 @@ def retrieve_blocks_per_token(arc: Archive, q: torch.Tensor, groups: int, limit:
               if (q_hist is not None and lead == 0 and q_hist.shape[0] > 1) else q_step)
     t_ev, h, d = q_eval.shape
     kv = h // groups
-    ref_pos = max(limit, arc.prompt_len - MEMORY["window"])
+    ref_pos = limit
     s_dtype = q_eval.dtype if (q_eval.is_cuda and q_eval.dtype in (torch.bfloat16, torch.float16)) else torch.float32
     qg_s = q_eval.to(s_dtype).permute(1, 0, 2).reshape(kv, groups * t_ev, d)
     if ROPE_HORIZON > 0 and ref_pos > ROPE_HORIZON:
@@ -1002,7 +1029,7 @@ def retrieve_blocks_per_token(arc: Archive, q: torch.Tensor, groups: int, limit:
             cand_part = cand[:, c_s:c_e]
             ck_part = _gather_blocks(arc.keys, cand_part, block).to(device=q.device, dtype=torch.float32)
             if ROPE_HORIZON > 0 and ref_pos > ROPE_HORIZON:
-                ck_part = _reposition_rope_blocks(ck_part, cand_part, block, ref_pos, contiguous_runs=False)
+                ck_part = _reposition_rope_blocks(ck_part, cand_part, block, ref_pos, contiguous_runs=False, span=0)
             ex_part = torch.bmm(qg, ck_part.transpose(-1, -2)).view(kv, groups, t_ev, c_e - c_s, block).amax(-1).amax(1)
             exact_parts.append(ex_part)
         exact = torch.cat(exact_parts, dim=-1) if len(exact_parts) > 1 else exact_parts[0]
@@ -1133,7 +1160,7 @@ def piece_attention(arc: Archive, q: torch.Tensor, q_pos: torch.Tensor, top: tor
                 arc.cached_top = top
                 arc.cached_rk = rk_raw
                 arc.cached_rv = rv
-                ref_pos = max(lo, arc.prompt_len - window)
+                ref_pos = lo
                 rk = _reposition_rope_blocks(rk_raw, top, block, ref_pos, contiguous_runs=True)
                 if ns > 0:
                     if arc.sink_k is not None and ns <= arc.sink_k.shape[0]:
@@ -1142,6 +1169,7 @@ def piece_attention(arc: Archive, q: torch.Tensor, q_pos: torch.Tensor, top: tor
                     else:
                         sk_t = arc.keys[:, :ns].to(device=q.device, dtype=q.dtype).transpose(0, 1)
                         sv_t = arc.values[:, :ns].to(device=q.device, dtype=q.dtype).transpose(0, 1)
+                    sk_t = _reposition_rope_sinks(sk_t, block, ref_pos)
                     pre_k = torch.cat((sk_t, rk.transpose(0, 1)), dim=0)
                     pre_v = torch.cat((sv_t, rv.transpose(0, 1)), dim=0)
                 else:
@@ -1172,13 +1200,16 @@ def piece_attention(arc: Archive, q: torch.Tensor, q_pos: torch.Tensor, top: tor
     unmasked = (t == 1 and own is None)
     need_mask = not (use_lse or unmasked)
     parts_k, parts_v, parts_allow = [], [], []
+    ref_pos = lo
     if ns > 0:
         if arc.sink_k is not None and ns <= arc.sink_k.shape[0]:
-            parts_k.append(arc.sink_k[:ns].transpose(0, 1).to(dtype=q.dtype))
-            parts_v.append(arc.sink_v[:ns].transpose(0, 1).to(dtype=q.dtype))
+            sk = arc.sink_k[:ns].transpose(0, 1).to(dtype=q.dtype)
+            sv = arc.sink_v[:ns].transpose(0, 1).to(dtype=q.dtype)
         else:
-            parts_k.append(arc.keys[:, :ns].to(device=q.device).to(dtype=q.dtype))
-            parts_v.append(arc.values[:, :ns].to(device=q.device).to(dtype=q.dtype))
+            sk = arc.keys[:, :ns].to(device=q.device).to(dtype=q.dtype)
+            sv = arc.values[:, :ns].to(device=q.device).to(dtype=q.dtype)
+        parts_k.append(_reposition_rope_sinks(sk, block, ref_pos))
+        parts_v.append(sv)
         if need_mask:
             parts_allow.append(torch.ones(t, ns, dtype=torch.bool, device=q.device))
     if top is not None:
@@ -1188,7 +1219,6 @@ def piece_attention(arc: Archive, q: torch.Tensor, q_pos: torch.Tensor, top: tor
             rk_raw = _gather_blocks(arc.keys, top, block).to(device=q.device).to(dtype=q.dtype)       # [KV, R, D]
         arc.last_top = arc.last_rk = None
         rv = _gather_blocks(arc.values, top, block).to(device=q.device).to(dtype=q.dtype)
-        ref_pos = max(lo, arc.prompt_len - window)
         rk = _reposition_rope_blocks(rk_raw, top, block, ref_pos, contiguous_runs=True)
         parts_k.append(rk); parts_v.append(rv)
         if own is None and arc.prompt_top is not None:
@@ -1378,6 +1408,16 @@ def windowed_attention_with_memory(attn_module, q: torch.Tensor, k: torch.Tensor
                 req_bounds[i] = (int(next(p_it)), int(next(p_it)))
         BATCH["req_bounds"] = req_bounds
         BATCH["req_bounds_T"] = T
+        if any(p0 == 0 for p0, _ in req_bounds.values()):
+            try:
+                mt = os.path.getmtime(__file__)
+                if mt > _MTIME:
+                    import importlib
+                    import sys
+                    importlib.reload(sys.modules[__name__])
+                    return sys.modules[__name__].windowed_attention_with_memory(attn_module, q, k, v, positions)
+            except Exception:
+                pass
     pos_list = BATCH.get("pos_list")
     skip_base = not NORETRIEVE and not ORACLE
     if skip_base:

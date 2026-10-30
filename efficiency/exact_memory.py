@@ -18,16 +18,18 @@ from dataclasses import dataclass
 import torch
 
 EXACT_MEMORY = {"enabled": False, "blocks": 64, "block_size": 64, "decode_blocks": 64, "neighbors": 0, "rerank": 0,
-                "decode_rerank": 0, "superblock": 64, "rope_horizon": 262144, "rope_arc_span": 98304,
+                "decode_rerank": 0, "superblock": 64, "rope_horizon": 262144, "rope_arc_span": 16384,
                 "rope_theta": 10000000.0, "keys_like_values": False}  # decode_blocks: O(1) budget when the
 # query chunk is short (<= 64 tokens, i.e. decoding); 0 = same as blocks. superblock: 2-level hierarchical Quest
 # super-block size (64 blocks = 4,096 tokens per super-block, 256 super-blocks at 1M). keys_like_values: archive keys
 # in the values' dtype (bf16 under autocast, as the serving KV cache stores them).
 
 
-def _reposition_rope_blocks(rk: torch.Tensor, blk_idx: torch.Tensor, block: int, ref_pos: int) -> torch.Tensor:
+def _reposition_rope_blocks(
+    rk: torch.Tensor, blk_idx: torch.Tensor, block: int, ref_pos: int, span: int | None = None
+) -> torch.Tensor:
     horizon = int(EXACT_MEMORY.get("rope_horizon", 262144) or 0)
-    arc_span = int(EXACT_MEMORY.get("rope_arc_span", 98304) or 98304)
+    arc_span = int(EXACT_MEMORY.get("rope_arc_span", 16384) or 16384) if span is None else span
     theta = float(EXACT_MEMORY.get("rope_theta", 10000000.0) or 10000000.0)
     if horizon <= 0 or ref_pos <= horizon or rk.numel() == 0:
         return rk
@@ -171,7 +173,7 @@ def retrieve(archive: Archive | None, q: torch.Tensor, groups: int) -> tuple[tor
                 cand = score.topk(c, dim=-1).indices                               # [B,KV,c]
                 idx = (cand.unsqueeze(-1) * block + torch.arange(block, device=q.device)).view(b, kv, -1)
                 ck = archive.keys.gather(2, idx.unsqueeze(-1).expand(-1, -1, -1, d)).float()   # [B,KV,c*block,d]
-                ck = _reposition_rope_blocks(ck, cand, block, archive.length)
+                ck = _reposition_rope_blocks(ck, cand, block, archive.length, span=0)
                 exact = torch.einsum("bgqd,bgnd->bgqn", qg, ck).amax(2).view(b, kv, c, block).amax(-1)  # [B,KV,c]
                 top = cand.gather(-1, exact.topk(k, dim=-1).indices)
             else:
