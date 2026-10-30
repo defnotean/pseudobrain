@@ -288,7 +288,7 @@ class PB27Qwen4ExpNVFP4PLEEmbedding(nn.Module):
             )
             if n >= 1024:
                 self._tokens_seen += n
-                if self._tokens_seen >= 131072:
+                if self._tokens_seen >= 65536:
                     self._tokens_seen = 0
                     torch.cuda.current_stream().synchronize()
                     for mm in self._mmaps:
