@@ -18,7 +18,7 @@ from dataclasses import dataclass
 import torch
 
 EXACT_MEMORY = {"enabled": False, "blocks": 64, "block_size": 64, "decode_blocks": 64, "neighbors": 0, "rerank": 0,
-                "decode_rerank": 0, "superblock": 64, "rope_horizon": 262144, "rope_arc_span": 229376,
+                "decode_rerank": 0, "superblock": 64, "rope_horizon": 262144, "rope_arc_span": 98304,
                 "rope_theta": 10000000.0, "keys_like_values": False}  # decode_blocks: O(1) budget when the
 # query chunk is short (<= 64 tokens, i.e. decoding); 0 = same as blocks. superblock: 2-level hierarchical Quest
 # super-block size (64 blocks = 4,096 tokens per super-block, 256 super-blocks at 1M). keys_like_values: archive keys
@@ -29,7 +29,7 @@ def _reposition_rope_blocks(
     rk: torch.Tensor, blk_idx: torch.Tensor, block: int, ref_pos: int, span: int | None = None
 ) -> torch.Tensor:
     horizon = int(EXACT_MEMORY.get("rope_horizon", 262144) or 0)
-    arc_span = int(EXACT_MEMORY.get("rope_arc_span", 229376) or 229376) if span is None else span
+    arc_span = int(EXACT_MEMORY.get("rope_arc_span", 98304) or 98304) if span is None else span
     theta = float(EXACT_MEMORY.get("rope_theta", 10000000.0) or 10000000.0)
     if horizon <= 0 or ref_pos <= horizon or rk.numel() == 0:
         return rk
@@ -40,9 +40,20 @@ def _reposition_rope_blocks(
     d_rot = d // 4
     half = d_rot // 2
     orig_pos = (blk_idx * block).to(device=rk.device, dtype=torch.float32)
-    scale = min(1.0, float(arc_span) / max(1.0, float(ref_pos)))
-    target_pos = max(0, ref_pos - arc_span) + orig_pos * scale
-    delta = target_pos - orig_pos
+    if arc_span == 0:
+        end_pos = float(max(0, ref_pos - 2 * block))
+        delta = (end_pos - orig_pos).clamp(min=0.0)
+    else:
+        scale = 1.0 - min(1.0, float(arc_span) / max(1.0, float(ref_pos)))
+        target_pos = orig_pos + torch.round((float(ref_pos) - orig_pos).clamp(min=0.0) * scale)
+        if n_blk > 1:
+            j_off = torch.arange(n_blk, device=rk.device, dtype=torch.float32).view(1, 1, n_blk) * float(block)
+            target_pos = torch.cummax(target_pos - j_off, dim=2).values + j_off
+            max_end = float(max(0, ref_pos - block))
+            target_pos = torch.minimum(target_pos, max_end - (float((n_blk - 1) * block) - j_off))
+        else:
+            target_pos = target_pos.clamp(max=float(max(0, ref_pos - block)))
+        delta = (target_pos - orig_pos).clamp(min=0.0)
     inv_freq = 1.0 / (theta ** (torch.arange(0, d_rot, 2, device=rk.device, dtype=torch.float32) / float(d_rot)))
     angles = delta.unsqueeze(-1) * inv_freq
     cos, sin = angles.cos().unsqueeze(3), angles.sin().unsqueeze(3)
@@ -159,7 +170,7 @@ def retrieve(archive: Archive | None, q: torch.Tensor, groups: int) -> tuple[tor
                 cand = score.topk(c, dim=-1).indices                               # [B,KV,c]
                 idx = (cand.unsqueeze(-1) * block + torch.arange(block, device=q.device)).view(b, kv, -1)
                 ck = archive.keys.gather(2, idx.unsqueeze(-1).expand(-1, -1, -1, d)).float()   # [B,KV,c*block,d]
-                ck = _reposition_rope_blocks(ck, cand, block, archive.length)
+                ck = _reposition_rope_blocks(ck, cand, block, archive.length, span=0)
                 exact = torch.einsum("bgqd,bgnd->bgqn", qg, ck).amax(2).view(b, kv, c, block).amax(-1)  # [B,KV,c]
                 top = cand.gather(-1, exact.topk(k, dim=-1).indices)
             else:
