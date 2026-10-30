@@ -18,10 +18,52 @@ from dataclasses import dataclass
 import torch
 
 EXACT_MEMORY = {"enabled": False, "blocks": 64, "block_size": 64, "decode_blocks": 64, "neighbors": 0, "rerank": 0,
-                "decode_rerank": 0, "superblock": 64, "keys_like_values": False}  # decode_blocks: O(1) budget when the
+                "decode_rerank": 0, "superblock": 64, "rope_horizon": 262144, "rope_arc_span": 98304,
+                "rope_theta": 10000000.0, "keys_like_values": False}  # decode_blocks: O(1) budget when the
 # query chunk is short (<= 64 tokens, i.e. decoding); 0 = same as blocks. superblock: 2-level hierarchical Quest
 # super-block size (64 blocks = 4,096 tokens per super-block, 256 super-blocks at 1M). keys_like_values: archive keys
 # in the values' dtype (bf16 under autocast, as the serving KV cache stores them).
+
+
+def _reposition_rope_blocks(rk: torch.Tensor, blk_idx: torch.Tensor, block: int, ref_pos: int) -> torch.Tensor:
+    horizon = int(EXACT_MEMORY.get("rope_horizon", 262144) or 0)
+    arc_span = int(EXACT_MEMORY.get("rope_arc_span", 98304) or 98304)
+    theta = float(EXACT_MEMORY.get("rope_theta", 10000000.0) or 10000000.0)
+    if horizon <= 0 or ref_pos <= horizon or rk.numel() == 0:
+        return rk
+    b, kv, total_t, d = rk.shape
+    n_blk = blk_idx.shape[2]
+    if n_blk == 0 or total_t != n_blk * block:
+        return rk
+    d_rot = d // 4
+    half = d_rot // 2
+    idx = blk_idx.to(device=rk.device, dtype=torch.long).clone()
+    if n_blk > 1:
+        is_succ = torch.zeros_like(idx, dtype=torch.bool)
+        is_succ[:, :, 1:] = idx[:, :, 1:] == (idx[:, :, :-1] + 1)
+        step = 1
+        while step < n_blk:
+            prev_idx = torch.roll(idx, shifts=step, dims=2)
+            prev_succ = torch.roll(is_succ, shifts=step, dims=2)
+            prev_succ[:, :, :step] = False
+            idx = torch.where(is_succ, prev_idx, idx)
+            is_succ = is_succ & prev_succ
+            if not bool(is_succ.any()):
+                break
+            step *= 2
+    orig_pos = (idx * block).to(torch.float32)
+    scale = 1.0 - min(1.0, float(arc_span) / float(max(1, ref_pos)))
+    max_shift = (float(max(0, ref_pos - 2 * block)) - orig_pos).clamp(min=0.0)
+    delta = torch.minimum(torch.round((float(ref_pos) - orig_pos).clamp(min=0.0) * scale), max_shift)
+    inv_freq = 1.0 / (theta ** (torch.arange(0, d_rot, 2, device=rk.device, dtype=torch.float32) / float(d_rot)))
+    angles = delta.unsqueeze(-1) * inv_freq
+    cos, sin = angles.cos().unsqueeze(3), angles.sin().unsqueeze(3)
+    rk_v = rk.view(b, kv, n_blk, block, d)
+    x1, x2 = rk_v[..., :half].float(), rk_v[..., half:d_rot].float()
+    out = rk.clone().view(b, kv, n_blk, block, d)
+    out[..., :half] = (x1 * cos - x2 * sin).to(rk.dtype)
+    out[..., half:d_rot] = (x2 * cos + x1 * sin).to(rk.dtype)
+    return out.view(b, kv, total_t, d)
 
 
 @dataclass
@@ -129,6 +171,7 @@ def retrieve(archive: Archive | None, q: torch.Tensor, groups: int) -> tuple[tor
                 cand = score.topk(c, dim=-1).indices                               # [B,KV,c]
                 idx = (cand.unsqueeze(-1) * block + torch.arange(block, device=q.device)).view(b, kv, -1)
                 ck = archive.keys.gather(2, idx.unsqueeze(-1).expand(-1, -1, -1, d)).float()   # [B,KV,c*block,d]
+                ck = _reposition_rope_blocks(ck, cand, block, archive.length)
                 exact = torch.einsum("bgqd,bgnd->bgqn", qg, ck).amax(2).view(b, kv, c, block).amax(-1)  # [B,KV,c]
                 top = cand.gather(-1, exact.topk(k, dim=-1).indices)
             else:
@@ -144,7 +187,8 @@ def retrieve(archive: Archive | None, q: torch.Tensor, groups: int) -> tuple[tor
         top = top.sort(-1).values                                         # keep position order (duplicates harmless)
         idx = (top.unsqueeze(-1) * block + torch.arange(block, device=q.device)).view(b, kv, -1)
         gather = idx.unsqueeze(-1).expand(-1, -1, -1, d)
-        parts_k.append(archive.keys.gather(2, gather))
+        rk = _reposition_rope_blocks(archive.keys.gather(2, gather), top, block, archive.length)
+        parts_k.append(rk)
         parts_v.append(archive.values.gather(2, gather))
     if tail:
         parts_k.append(archive.keys[:, :, full * block:])

@@ -46,7 +46,10 @@ FAITHFUL = os.environ.get("PB27_MEMORY_FAITHFUL", "1") != "0"    # mirror effici
 ORIGIN = SINKS if FAITHFUL else 0                                  # after the sinks (blocks at 4+64j) and keeps tail
 QWIN = os.environ.get("PB27_MEMORY_QWIN", "") == "1"             # decode retrieval uses trailing verified query window
 DSTEP = os.environ.get("PB27_MEMORY_DSTEP", "") == "1"           # step-1 decode uses `blocks`; step-2+ decode uses `decode_blocks`
-SCALE = [int(x) for x in os.environ.get("PB27_MEMORY_SCALE", "2048:384:4096:512:8192:1536").split(":") if x.strip()]
+SCALE = [int(x) for x in os.environ.get("PB27_MEMORY_SCALE", "2048:384:4096:512:8192:512").split(":") if x.strip()]
+ROPE_HORIZON = int(os.environ.get("PB27_MEMORY_ROPE_HORIZON", "262144") or 262144)
+ROPE_ARC_SPAN = int(os.environ.get("PB27_MEMORY_ROPE_ARC_SPAN", "98304") or 98304)
+ROPE_THETA = float(os.environ.get("PB27_MEMORY_ROPE_THETA", "10000000.0") or 10000000.0)
 OFFLOAD = os.environ.get("PB27_MEMORY_OFFLOAD", "nvme").strip().lower()  # "", "cpu", "fp8", "cpu_fp8", or "nvme"
 # "nvme": fp8/bf16 K/V live in an unlinked sparse file mapped into memory (page cache is evictable, so resident memory
 # stays flat while disk holds the history); block bounds stay resident. NVME_CAP is the max tokens per request.
@@ -324,7 +327,7 @@ class Archive:
             self.keys[:, p_idx] = kt.to(device=self.keys.device, dtype=self.keys.dtype)
             self.values[:, p_idx] = vt.to(device=self.values.device, dtype=self.values.dtype)
         self.size = max(self.size, hi)
-        if self.mapped and self.size - self.last_evict_pos >= 131072:
+        if self.mapped and self.size - self.last_evict_pos >= 65536:
             self.evict_page_cache()
             self.last_evict_pos = self.size
         if hi - 1 < ORIGIN:
@@ -443,6 +446,13 @@ def drop_request(req_id: str, tokens: torch.Tensor | None = None) -> None:
     if RETAIN <= 0 or tokens is None or len(tokens) < 2 or any(a.hole_hi > a.hole_lo for a in archives.values()):
         _free(archives)
         return
+    for arc in archives.values():
+        arc.prompt_top = arc.decode_top = arc.last_top = arc.last_rk = None
+        arc.cached_top = arc.cached_rk = arc.cached_rv = None
+        arc.cached_pre_k = arc.cached_pre_v = arc.cached_cu = None
+        arc.cached_ns = -1
+        if arc.mapped:
+            arc.evict_page_cache()
     RETIRED.append({"tokens": tokens, "archives": archives})
     while len(RETIRED) > RETAIN:
         _free(RETIRED.pop(0)["archives"])
@@ -492,6 +502,78 @@ def _gather_tokens(t: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
     if t.dtype == torch.float8_e4m3fn:
         return t[torch.arange(t.shape[0], device=t.device)[:, None], idx]
     return t.gather(1, idx.unsqueeze(-1).expand(-1, -1, t.shape[2]))
+
+
+_ROPE_INV_FREQ: dict[tuple[torch.device, int], torch.Tensor] = {}
+
+
+def _get_rope_inv_freq(device: torch.device, d_rot: int) -> torch.Tensor:
+    key = (device, d_rot)
+    inv_freq = _ROPE_INV_FREQ.get(key)
+    if inv_freq is None:
+        inv_freq = 1.0 / (
+            ROPE_THETA ** (torch.arange(0, d_rot, 2, device=device, dtype=torch.float32) / float(d_rot))
+        )
+        _ROPE_INV_FREQ[key] = inv_freq
+    return inv_freq
+
+
+def _reposition_rope_blocks(
+    rk: torch.Tensor,
+    blk_idx: torch.Tensor,
+    block: int,
+    ref_pos: int,
+    contiguous_runs: bool = True,
+) -> torch.Tensor:
+    """Compress archived-block rotary positions into `[ref_pos - ROPE_ARC_SPAN, ref_pos)` when `ref_pos > ROPE_HORIZON`.
+
+    Because 2D Neox-style RoPE is an abelian group (`RoPE(RoPE(k, p), delta) = RoPE(k, p + delta)`), rotating all
+    `block` tokens of block `b` by the same shift `delta_b` preserves exact `+1` relative token offsets inside each
+    block, and propagating `delta_b` across contiguous block pairs `(b, b + 1)` preserves exact `+1` relative token
+    offsets across block boundaries while eliminating RoPE phase inversion beyond `ROPE_HORIZON`.
+    """
+    if ROPE_HORIZON <= 0 or ref_pos <= ROPE_HORIZON or rk.numel() == 0:
+        return rk
+    kv, total_t, d = rk.shape
+    n_blk = blk_idx.shape[1]
+    if n_blk == 0 or total_t != n_blk * block:
+        return rk
+    d_rot = d // 4
+    half = d_rot // 2
+    if half <= 0:
+        return rk
+    idx = blk_idx.to(device=rk.device, dtype=torch.long)
+    if contiguous_runs and n_blk > 1:
+        idx = idx.clone()
+        is_succ = torch.zeros_like(idx, dtype=torch.bool)
+        is_succ[:, 1:] = idx[:, 1:] == (idx[:, :-1] + 1)
+        step = 1
+        while step < n_blk:
+            prev_idx = torch.roll(idx, shifts=step, dims=1)
+            prev_succ = torch.roll(is_succ, shifts=step, dims=1)
+            prev_succ[:, :step] = False
+            idx = torch.where(is_succ, prev_idx, idx)
+            is_succ = is_succ & prev_succ
+            if not bool(is_succ.any()):
+                break
+            step *= 2
+    orig_pos = (ORIGIN + idx * block).to(torch.float32)
+    scale = 1.0 - min(1.0, float(ROPE_ARC_SPAN) / float(max(1, ref_pos)))
+    max_shift = (float(max(0, ref_pos - 2 * block)) - orig_pos).clamp(min=0.0)
+    delta = torch.minimum(torch.round((float(ref_pos) - orig_pos).clamp(min=0.0) * scale), max_shift)
+    inv_freq = _get_rope_inv_freq(rk.device, d_rot)
+    angles = delta.unsqueeze(-1) * inv_freq
+    cos = angles.cos().unsqueeze(2)
+    sin = angles.sin().unsqueeze(2)
+    rk_v = rk.view(kv, n_blk, block, d)
+    x1 = rk_v[..., :half].float()
+    x2 = rk_v[..., half:d_rot].float()
+    r1 = (x1 * cos - x2 * sin).to(rk.dtype)
+    r2 = (x2 * cos + x1 * sin).to(rk.dtype)
+    out = rk.clone().view(kv, n_blk, block, d)
+    out[..., :half] = r1
+    out[..., half:d_rot] = r2
+    return out.view(kv, total_t, d)
 
 
 def _gather_blocks(t: torch.Tensor, blk_idx: torch.Tensor, block: int) -> torch.Tensor:
@@ -578,6 +660,9 @@ def retrieve_blocks(arc: Archive, q: torch.Tensor, groups: int, limit: int, rera
     else:
         s_dtype = q.dtype if (q.is_cuda and q.dtype in (torch.bfloat16, torch.float16)) else torch.float32
         qg_s = q.to(s_dtype).permute(1, 0, 2).reshape(kv, groups * t, d)
+        if ROPE_HORIZON > 0 and limit > ROPE_HORIZON:
+            qg_s = qg_s.clone()
+            qg_s[..., : d // 4] = 0
         pos, neg = qg_s.clamp(min=0), qg_s.clamp(max=0)
         if not rerank and SBLK > 1 and arc.smax is not None and arc.smin is not None and full > SBLK * 16:
             n_sb = (full + SBLK - 1) // SBLK
@@ -763,8 +848,12 @@ def retrieve_blocks_per_token(arc: Archive, q: torch.Tensor, groups: int, limit:
               if (q_hist is not None and lead == 0 and q_hist.shape[0] > 1) else q_step)
     t_ev, h, d = q_eval.shape
     kv = h // groups
+    ref_pos = max(limit, arc.prompt_len - MEMORY["window"])
     s_dtype = q_eval.dtype if (q_eval.is_cuda and q_eval.dtype in (torch.bfloat16, torch.float16)) else torch.float32
     qg_s = q_eval.to(s_dtype).permute(1, 0, 2).reshape(kv, groups * t_ev, d)
+    if ROPE_HORIZON > 0 and ref_pos > ROPE_HORIZON:
+        qg_s = qg_s.clone()
+        qg_s[..., : d // 4] = 0
     pos, neg = qg_s.clamp(min=0), qg_s.clamp(max=0)
     n_valid = full
     hole_b0 = hole_b1 = 0
@@ -861,7 +950,7 @@ def retrieve_blocks_per_token(arc: Archive, q: torch.Tensor, groups: int, limit:
     for s_thresh, s_blocks in zip(SCALE[0::2], SCALE[1::2]):
         if n_arch > s_thresh:
             budget = max(budget, s_blocks)
-    k = min(max(budget, 1536 if n_arch > 8192 else (512 if n_arch > 4096 else (384 if n_arch > 2048 else budget))), n_valid)
+    k = min(max(budget, 512 if n_arch > 4096 else (384 if n_arch > 2048 else budget)), n_valid)
     rerank_pool = max(MEMORY["rerank"], 2 * k) if MEMORY["rerank"] > 0 else 0
     c0 = min(max(rerank_pool, k), n_valid)
     cand_mult = max(PERTOKEN_CAND, 2) if (lead is not None or t_ev > 1) else max(PERTOKEN_CAND, 1)
@@ -910,7 +999,10 @@ def retrieve_blocks_per_token(arc: Archive, q: torch.Tensor, groups: int, limit:
         exact_parts = []
         for c_s in range(0, c, 1024):
             c_e = min(c, c_s + 1024)
-            ck_part = _gather_blocks(arc.keys, cand[:, c_s:c_e], block).to(device=q.device, dtype=torch.float32)
+            cand_part = cand[:, c_s:c_e]
+            ck_part = _gather_blocks(arc.keys, cand_part, block).to(device=q.device, dtype=torch.float32)
+            if ROPE_HORIZON > 0 and ref_pos > ROPE_HORIZON:
+                ck_part = _reposition_rope_blocks(ck_part, cand_part, block, ref_pos, contiguous_runs=False)
             ex_part = torch.bmm(qg, ck_part.transpose(-1, -2)).view(kv, groups, t_ev, c_e - c_s, block).amax(-1).amax(1)
             exact_parts.append(ex_part)
         exact = torch.cat(exact_parts, dim=-1) if len(exact_parts) > 1 else exact_parts[0]
@@ -1036,11 +1128,13 @@ def piece_attention(arc: Archive, q: torch.Tensor, q_pos: torch.Tensor, top: tor
                 pre_k = arc.cached_pre_k.to(dtype=q.dtype)
                 pre_v = arc.cached_pre_v.to(dtype=q.dtype)
             else:
-                rk, rv = _gather_cached_delta(arc, top, block, q.dtype, q.device)
+                rk_raw, rv = _gather_cached_delta(arc, top, block, q.dtype, q.device)
                 arc.last_top = arc.last_rk = None
                 arc.cached_top = top
-                arc.cached_rk = rk
+                arc.cached_rk = rk_raw
                 arc.cached_rv = rv
+                ref_pos = max(lo, arc.prompt_len - window)
+                rk = _reposition_rope_blocks(rk_raw, top, block, ref_pos, contiguous_runs=True)
                 if ns > 0:
                     if arc.sink_k is not None and ns <= arc.sink_k.shape[0]:
                         sk_t = arc.sink_k[:ns].to(dtype=q.dtype)
@@ -1089,15 +1183,17 @@ def piece_attention(arc: Archive, q: torch.Tensor, q_pos: torch.Tensor, top: tor
             parts_allow.append(torch.ones(t, ns, dtype=torch.bool, device=q.device))
     if top is not None:
         if arc.last_top is top and arc.last_rk is not None:
-            rk = arc.last_rk.to(dtype=q.dtype)
+            rk_raw = arc.last_rk.to(dtype=q.dtype)
         else:
-            rk = _gather_blocks(arc.keys, top, block).to(device=q.device).to(dtype=q.dtype)       # [KV, R, D]
+            rk_raw = _gather_blocks(arc.keys, top, block).to(device=q.device).to(dtype=q.dtype)       # [KV, R, D]
         arc.last_top = arc.last_rk = None
         rv = _gather_blocks(arc.values, top, block).to(device=q.device).to(dtype=q.dtype)
+        ref_pos = max(lo, arc.prompt_len - window)
+        rk = _reposition_rope_blocks(rk_raw, top, block, ref_pos, contiguous_runs=True)
         parts_k.append(rk); parts_v.append(rv)
         if own is None and arc.prompt_top is not None:
             arc.cached_top = top
-            arc.cached_rk = rk
+            arc.cached_rk = rk_raw
             arc.cached_rv = rv
             arc.cached_ns = ns
             arc.cached_pre_k = (parts_k[0] if len(parts_k) == 1 else torch.cat(parts_k, dim=1)).transpose(0, 1).contiguous()
@@ -1185,6 +1281,9 @@ def install_runner_hooks() -> None:
         num_computed = kwargs.get("num_computed_tokens", args[1] if len(args) > 1 else 0)
         if all_token_ids is not None and num_computed:
             adopt_for_request(req_id, all_token_ids, int(num_computed))
+        if int(prompt_len) > 262144 and not ADOPTED.get(req_id, ({},))[0] and len(RETIRED) >= max(1, RETAIN):
+            while RETIRED:
+                _free(RETIRED.pop(0)["archives"])
         return orig_add(self, req_id, prompt_len, *args, **kwargs)
 
     def remove_request(self, req_id, *args, **kwargs):
