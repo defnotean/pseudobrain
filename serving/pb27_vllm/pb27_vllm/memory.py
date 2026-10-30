@@ -519,6 +519,34 @@ def _get_rope_inv_freq(device: torch.device, d_rot: int) -> torch.Tensor:
     return inv_freq
 
 
+def _reposition_rope_sinks(sk: torch.Tensor, ref_pos: int, span: int | None = None) -> torch.Tensor:
+    """Reposition the sink keys `sk` [KV, ns, D] from original positions `0..ns-1` to sit immediately before the
+    repositioned archive span `[ref_pos - ROPE_ARC_SPAN, ref_pos)` when `ref_pos > ROPE_HORIZON`."""
+    if ROPE_HORIZON <= 0 or ref_pos <= ROPE_HORIZON or sk.numel() == 0:
+        return sk
+    kv, ns, d = sk.shape
+    d_rot = d // 4
+    half = d_rot // 2
+    if half <= 0:
+        return sk
+    arc_span = ROPE_ARC_SPAN if span is None else span
+    delta_val = float(max(0, ref_pos - arc_span - ORIGIN))
+    if delta_val <= 0.0:
+        return sk
+    inv_freq = _get_rope_inv_freq(sk.device, d_rot)
+    angles = delta_val * inv_freq
+    cos = angles.cos().view(1, 1, half)
+    sin = angles.sin().view(1, 1, half)
+    x1 = sk[..., :half].float()
+    x2 = sk[..., half:d_rot].float()
+    r1 = (x1 * cos - x2 * sin).to(sk.dtype)
+    r2 = (x2 * cos + x1 * sin).to(sk.dtype)
+    out = sk.clone()
+    out[..., :half] = r1
+    out[..., half:d_rot] = r2
+    return out
+
+
 def _reposition_rope_blocks(
     rk: torch.Tensor,
     blk_idx: torch.Tensor,
@@ -531,9 +559,8 @@ def _reposition_rope_blocks(
 
     Because 2D Neox-style RoPE is an abelian group (`RoPE(RoPE(k, p), delta) = RoPE(k, p + delta)`), rotating all
     `block` tokens of block `b` by the same shift `delta_b` preserves exact `+1` relative token offsets inside each
-    block, and enforcing `target_pos[:, j] - target_pos[:, j-1] >= block` via `torch.cummax` preserves exact `+1`
-    relative token offsets across contiguous block pairs `(b, b + 1)` while guaranteeing zero rotary position
-    collisions between nearby blocks.
+    block, and assigning the same `delta_b` across contiguous block runs `[b, b + 1, ...]` preserves exact `+1`
+    relative token offsets across block boundaries without cross-head rotary drift.
     """
     if ROPE_HORIZON <= 0 or ref_pos <= ROPE_HORIZON or rk.numel() == 0:
         return rk
@@ -546,21 +573,24 @@ def _reposition_rope_blocks(
     if half <= 0:
         return rk
     idx = blk_idx.to(device=rk.device, dtype=torch.long)
-    orig_pos = (ORIGIN + idx * block).to(torch.float32)
     arc_span = ROPE_ARC_SPAN if span is None else span
+    if contiguous_runs and arc_span > 0 and n_blk > 1:
+        is_succ = torch.zeros_like(idx, dtype=torch.bool)
+        is_succ[:, 1:] = idx[:, 1:] == (idx[:, :-1] + 1)
+        step = 1
+        while step < n_blk:
+            prev_idx = torch.cat((idx[:, :step], idx[:, :-step]), dim=1)
+            prev_succ = torch.cat((torch.zeros_like(is_succ[:, :step]), is_succ[:, :-step]), dim=1)
+            idx = torch.where(is_succ, prev_idx, idx)
+            is_succ = is_succ & prev_succ
+            step <<= 1
+    orig_pos = (ORIGIN + idx * block).to(torch.float32)
     if arc_span == 0 or not contiguous_runs:
         end_pos = float(max(0, ref_pos - 2 * block))
         delta = (end_pos - orig_pos).clamp(min=0.0)
     else:
         scale = 1.0 - min(1.0, float(arc_span) / float(max(1, ref_pos)))
         target_pos = orig_pos + torch.round((float(ref_pos) - orig_pos).clamp(min=0.0) * scale)
-        if n_blk > 1:
-            j_off = torch.arange(n_blk, device=rk.device, dtype=torch.float32).unsqueeze(0) * float(block)
-            target_pos = torch.cummax(target_pos - j_off, dim=1).values + j_off
-            max_end = float(max(0, ref_pos - block))
-            target_pos = torch.minimum(target_pos, max_end - (float((n_blk - 1) * block) - j_off))
-        else:
-            target_pos = target_pos.clamp(max=float(max(0, ref_pos - block)))
         delta = (target_pos - orig_pos).clamp(min=0.0)
     inv_freq = _get_rope_inv_freq(rk.device, d_rot)
     angles = delta.unsqueeze(-1) * inv_freq
@@ -1147,11 +1177,12 @@ def piece_attention(arc: Archive, q: torch.Tensor, q_pos: torch.Tensor, top: tor
                 rk = _reposition_rope_blocks(rk_raw, top, block, ref_pos, contiguous_runs=True)
                 if ns > 0:
                     if arc.sink_k is not None and ns <= arc.sink_k.shape[0]:
-                        sk_t = arc.sink_k[:ns].to(dtype=q.dtype)
+                        sk_kv = arc.sink_k[:ns].transpose(0, 1).to(dtype=q.dtype)
                         sv_t = arc.sink_v[:ns].to(dtype=q.dtype)
                     else:
-                        sk_t = arc.keys[:, :ns].to(device=q.device, dtype=q.dtype).transpose(0, 1)
+                        sk_kv = arc.keys[:, :ns].to(device=q.device, dtype=q.dtype)
                         sv_t = arc.values[:, :ns].to(device=q.device, dtype=q.dtype).transpose(0, 1)
+                    sk_t = _reposition_rope_sinks(sk_kv, ref_pos).transpose(0, 1)
                     pre_k = torch.cat((sk_t, rk.transpose(0, 1)), dim=0)
                     pre_v = torch.cat((sv_t, rv.transpose(0, 1)), dim=0)
                 else:
@@ -1185,11 +1216,12 @@ def piece_attention(arc: Archive, q: torch.Tensor, q_pos: torch.Tensor, top: tor
     ref_pos = lo
     if ns > 0:
         if arc.sink_k is not None and ns <= arc.sink_k.shape[0]:
-            parts_k.append(arc.sink_k[:ns].transpose(0, 1).to(dtype=q.dtype))
+            sk_kv = arc.sink_k[:ns].transpose(0, 1).to(dtype=q.dtype)
             parts_v.append(arc.sink_v[:ns].transpose(0, 1).to(dtype=q.dtype))
         else:
-            parts_k.append(arc.keys[:, :ns].to(device=q.device).to(dtype=q.dtype))
+            sk_kv = arc.keys[:, :ns].to(device=q.device).to(dtype=q.dtype)
             parts_v.append(arc.values[:, :ns].to(device=q.device).to(dtype=q.dtype))
+        parts_k.append(_reposition_rope_sinks(sk_kv, ref_pos))
         if need_mask:
             parts_allow.append(torch.ones(t, ns, dtype=torch.bool, device=q.device))
     if top is not None:
@@ -1408,7 +1440,7 @@ def windowed_attention_with_memory(attn_module, q: torch.Tensor, k: torch.Tensor
             p_first, p_last = req_bounds[i]
             arc_existing = ARCHIVES.get((req_id, layer))
             has_hole = req_id in ADOPTED or (arc_existing is not None and arc_existing.hole_hi > arc_existing.hole_lo)
-            full_cov = (e - s) <= piece or PREFILL in ("pt", "1")
+            full_cov = (e - s) <= piece or PREFILL == "1"
             if has_hole or not full_cov or (p_last - p_first != e - s - 1) or (p_first - window + 1 < ORIGIN + block):
                 skip_base = False
                 break
@@ -1476,20 +1508,11 @@ def windowed_attention_with_memory(attn_module, q: torch.Tensor, k: torch.Tensor
         bounds = [(max(s, p1 - piece), p1) for p1 in range(e, s, -piece)]
         q_piece = max(piece, 160)
         if is_prefill and PREFILL == "pt":
-            # the PyTorch tier's decode-faithful semantics: the prefill chunk retrieves ONE block set shared by all its
-            # queries (bound only), and the final piece (the question) gets its own retrieval with exact rescoring
+            # Keep vLLM's clean shift-invariant sliding-window output for haystack chunks and run exact rescoring
+            # retrieval + piece_attention only on the final question piece `(cut, e)` at the end of the prompt.
             at_prompt_end = p_last + 1 >= arc.prompt_len
             cut = (e - q_piece if e - s > q_piece else s) if at_prompt_end else e
-            bounds = []
-            if cut > s:                            # split at the same absolute 2048-token boundaries the PyTorch
-                p_s = p_first                      # stream uses (vLLM's prefill chunks can be ~8k tokens)
-                b0 = s
-                for p in range((p_s // PT_CHUNK + 1) * PT_CHUNK, p_s + (cut - s), PT_CHUNK):
-                    b = s + (p - p_s)              # positions are contiguous within a request's prefill chunk
-                    bounds.append((b0, b)); b0 = b
-                bounds.append((b0, cut))
-            if cut < e:
-                bounds.append((cut, e))
+            bounds = [(cut, e)] if cut < e else []
         elif is_prefill and PREFILL not in ("0", "1"):
             bounds = bounds[:TAIL]                 # retrieval during prefill only in the last TAIL pieces of the chunk
         for p0, p1 in bounds:

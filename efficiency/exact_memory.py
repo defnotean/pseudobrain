@@ -39,20 +39,24 @@ def _reposition_rope_blocks(
         return rk
     d_rot = d // 4
     half = d_rot // 2
-    orig_pos = (blk_idx * block).to(device=rk.device, dtype=torch.float32)
+    idx = blk_idx.to(device=rk.device, dtype=torch.long)
+    if arc_span > 0 and n_blk > 1:
+        is_succ = torch.zeros_like(idx, dtype=torch.bool)
+        is_succ[:, :, 1:] = idx[:, :, 1:] == (idx[:, :, :-1] + 1)
+        step = 1
+        while step < n_blk:
+            prev_idx = torch.cat((idx[:, :, :step], idx[:, :, :-step]), dim=2)
+            prev_succ = torch.cat((torch.zeros_like(is_succ[:, :, :step]), is_succ[:, :, :-step]), dim=2)
+            idx = torch.where(is_succ, prev_idx, idx)
+            is_succ = is_succ & prev_succ
+            step <<= 1
+    orig_pos = (idx * block).to(dtype=torch.float32)
     if arc_span == 0:
         end_pos = float(max(0, ref_pos - 2 * block))
         delta = (end_pos - orig_pos).clamp(min=0.0)
     else:
         scale = 1.0 - min(1.0, float(arc_span) / max(1.0, float(ref_pos)))
         target_pos = orig_pos + torch.round((float(ref_pos) - orig_pos).clamp(min=0.0) * scale)
-        if n_blk > 1:
-            j_off = torch.arange(n_blk, device=rk.device, dtype=torch.float32).view(1, 1, n_blk) * float(block)
-            target_pos = torch.cummax(target_pos - j_off, dim=2).values + j_off
-            max_end = float(max(0, ref_pos - block))
-            target_pos = torch.minimum(target_pos, max_end - (float((n_blk - 1) * block) - j_off))
-        else:
-            target_pos = target_pos.clamp(max=float(max(0, ref_pos - block)))
         delta = (target_pos - orig_pos).clamp(min=0.0)
     inv_freq = 1.0 / (theta ** (torch.arange(0, d_rot, 2, device=rk.device, dtype=torch.float32) / float(d_rot)))
     angles = delta.unsqueeze(-1) * inv_freq
