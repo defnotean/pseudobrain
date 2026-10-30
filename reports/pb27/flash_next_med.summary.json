@@ -1,0 +1,40 @@
+{
+ "n": 33,
+ "expected": 33,
+ "missing": 0,
+ "passed": 32,
+ "pass_rate": 0.9697,
+ "problems_solved_any": 32,
+ "problems": 33,
+ "by_tier": {
+  "easy": {
+   "passed": 8,
+   "n": 8,
+   "rate": 1.0
+  },
+  "fix": {
+   "passed": 3,
+   "n": 3,
+   "rate": 1.0
+  },
+  "hard": {
+   "passed": 9,
+   "n": 10,
+   "rate": 0.9
+  },
+  "medium": {
+   "passed": 12,
+   "n": 12,
+   "rate": 1.0
+  }
+ },
+ "no_code": 0,
+ "finish_length": 0,
+ "mean_completion_tokens": 1183,
+ "name": "flash_next_med",
+ "model": "pb27",
+ "reasoning_effort": "medium",
+ "temperature": 1.0,
+ "samples": 1,
+ "max_tokens": 32768
+}

@@ -1,0 +1,13 @@
+{
+ "task": "mmlu_pro",
+ "n": 150,
+ "model": "pb27",
+ "correct": 122,
+ "acc": 0.8133333333333334,
+ "stderr": 0.03192085664169661,
+ "unparsed": 7,
+ "truncated": 9,
+ "mean_completion_tokens": 1165.1266666666668,
+ "errors": 0,
+ "missing": 0
+}

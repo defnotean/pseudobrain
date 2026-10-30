@@ -26,6 +26,7 @@ tags:
 - **$O(1)$ Constant GPU KV Cache from `8K` to `1,000,000+` Tokens:** Local sliding window $W = 16,384$ + $4$ StreamingLLM sinks in GPU HBM (`--kv-cache-memory-bytes 6G–8G`, total GPU footprint `~29–33 GiB` even at $1,000,000$ tokens).
 - **Parallel Gated DeltaNet Recurrent Branches (`16` layers + `48` native GDN layers):** Carries dense global discourse state across the entire context.
 - **Unrotated Two-Hop Exact Memory Retrieval:** Evicted post-RoPE keys/values are archived in $64$-token blocks in sparse unlinked `mmap` files (`PB27_MEMORY_OFFLOAD=nvme`, `PB27_MEMORY_NVME_DTYPE=bf16`) with GPU-resident Quest min/max bounds, per-query Z-score + query-centered bound scoring, `[b, b+1]` successor expansion, and position-invariant 2-hop key-to-key bridge retrieval over the $75\%$ unrotated key subspace (`d // 4 :`), merged with the sliding window via FlashAttention-2 exact LSE rescaling.
+- **True $O(1)$ Constant-Speed Decode up to `1,000,000` Tokens:** Decouples prefill retrieval budget (`PB27_MEMORY_SCALE=2048:384:4096:512:8192:1536`, run once on the final prefill question chunk and pinned in `Archive.prompt_top` + GPU-cached `cached_pre_k`/`cached_pre_v`) from the incremental decode retrieval budget (`PB27_MEMORY_DECODE_BLOCKS=64`, `PB27_MEMORY_DECODE_RERANK=0`, `PB27_MEMORY_DECODE_STRIDE=64`) backed by 2-level hierarchical `bf16` super-block Quest bounds (`PB27_MEMORY_SUPERBLOCK=64`, `256` super-blocks at `1M`, `<0.05 ms` bound scoring, zero NVMe pages touched for rejected candidates during decode).
 
 ## Benchmark Summary
 

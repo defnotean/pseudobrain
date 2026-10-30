@@ -1,0 +1,13 @@
+{
+ "task": "gsm8k",
+ "n": 150,
+ "model": "pb27",
+ "correct": 144,
+ "acc": 0.96,
+ "stderr": 0.016053601490175633,
+ "unparsed": 0,
+ "truncated": 1,
+ "mean_completion_tokens": 393.79333333333335,
+ "errors": 0,
+ "missing": 0
+}

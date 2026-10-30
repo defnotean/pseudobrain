@@ -1,0 +1,11 @@
+{
+ "task": "mmlu",
+ "n": 300,
+ "model": "pb27",
+ "correct": 255,
+ "acc": 0.85,
+ "stderr": 0.020649973478972662,
+ "unparsed": 0,
+ "errors": 0,
+ "missing": 0
+}

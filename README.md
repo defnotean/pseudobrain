@@ -23,8 +23,8 @@ Stock Qwen3.5 (`27B` dense and `35B-A3B` MoE) interleaves 3 Gated DeltaNet layer
 | **Active Parameters / Token** | `27B` / `~3B` (`top-8` of `256` experts + `1` shared) | `27B` + `1.85B` GDN branches | `~3B` + `0.32B` GDN branches |
 | **GPU KV Cache at `1,000,000` Tokens** | `64 GiB` (`27B`) / `20 GiB` (`35B-A3B`) — OOMs | **`486 MiB` (`8.1%` of fixed `6 GiB` pool)** | **`486 MiB` (`8.1%` of fixed `6 GiB` pool)** |
 | **Total GPU Memory (`8K` to `1,000,000` Tokens)** | Grows linearly until OOM (`>262K`) | **Flat `~29–33 GiB`** | **Flat `~27–31 GiB`** |
-| **Exact Memory Hierarchy** | None | **Tier 1:** `16K` SWA + `4` sinks in GPU HBM<br>**Tier 2:** `<= 256K` GPU-First Archive (`273 GB/s`)<br>**Tier 3:** `256K–1M+` NVMe/Page-Cache `mmap` + GPU Quest bounds | **Tier 1:** `16K` SWA + `4` sinks in GPU HBM<br>**Tier 2:** `<= 256K` GPU-First Archive (`273 GB/s`)<br>**Tier 3:** `256K–1M+` NVMe/Page-Cache `mmap` + GPU Quest bounds |
-| **Multi-Hop Long-Context Retrieval** | Degrades past `256K` | Single-pass exact rescoring (`100%` needle to `1M`) | **Unrotated (`d // 4 :`) 2-Hop Key-to-Key Bridge (`100%` `needle`, `multi4`, `trace4` to `1M`)** |
+| **Exact Memory Hierarchy** | None | **Tier 1:** `16K` SWA + `4` sinks in GPU HBM<br>**Tier 2:** `<= 256K` GPU-First Archive (`273 GB/s`)<br>**Tier 3:** `256K–1M+` NVMe/Page-Cache `mmap` + 2-level `bf16` Quest super-blocks (`smax`/`smin`) | **Tier 1:** `16K` SWA + `4` sinks in GPU HBM<br>**Tier 2:** `<= 256K` GPU-First Archive (`273 GB/s`)<br>**Tier 3:** `256K–1M+` NVMe/Page-Cache `mmap` + 2-level `bf16` Quest super-blocks (`smax`/`smin`) |
+| **Multi-Hop Long-Context Retrieval & $O(1)$ Decode** | Degrades past `256K` | Unrotated (`d // 4 :`) 2-hop prefill retrieval (`prompt_top` pinned in GPU HBM) + $O(1)$ decode (`DECODE_STRIDE=64`, `DECODE_BLOCKS=64`, `DECODE_RERANK=0`) | Unrotated (`d // 4 :`) 2-hop prefill retrieval (`prompt_top` pinned in GPU HBM) + $O(1)$ decode (`DECODE_STRIDE=64`, `DECODE_BLOCKS=64`, `DECODE_RERANK=0`) |
 
 ---
 
