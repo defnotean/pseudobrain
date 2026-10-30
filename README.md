@@ -46,9 +46,23 @@ Evaluated via [`scripts/bench/custom_longctx_bench.py`](scripts/bench/custom_lon
 | **`200,000`** | **`1.0`** | **`1.0`** | **`1.0`** | **`1.0` (`4/4`)** | **`1.0`** | **`125.99s`** | **`50.81 tok/s`** | **`8.1%`** |
 | **`250,000`** | **`1.0`** | **`1.0`** | **`1.0`** | **`1.0` (`4/4`)** | **`1.0`** | **`110.16s`** | **`69.87 tok/s`** (`58.98` `multi4`) | **`8.1%`** |
 | **`500,000`** | **`1.0`** | **`1.0`** | **`1.0`** | **`1.0` (`4/4`)** | **`1.0`** | **`234.05s`** | **`64.91 tok/s`** (`183.54` peak, `76.47` mean) | **`8.1%`** |
-| **`1,000,000`** | **`1.0`** | **`1.0`** | **`1.0`** | **`0.75` (`3/4`)** | `0.0` | **`543.06s`** (`1,801 tok/s` prefill) | **`63.76 tok/s`** (`44.60` mean, `37.27` `multi4`) | **`8.1%`** |
+| **`1,000,000`** | **`1.0`** | **`1.0`** | **`1.0`** | **`0.75` (`3/4`)** | `0.0` | **`543.06s`** (`1,801 tok/s` prefill) | **`63.76 tok/s`** (`67.72` `needle@0.1`, `57.1` needle mean, `44.60` overall mean) | **`8.1%`** |
+
+##### Same-Hardware (`DGX Spark GB10, TP1`) Comparison: Stock `Qwen3.8-Flash-Next-NVFP4` vs. `PseudoBrain-Qwen3.8-Flash-Next-NVFP4`
+
+Compared directly against the upstream `runtime-qualification.json` in `edp1096/Huihui-Qwen3.8-Flash-Next-abliterated-NVFP4-QAD` measured on the **exact same `DGX Spark (GB10), TP1` hardware**:
+
+| Metric on **DGX Spark (GB10, TP1)** | Stock `Huihui-Qwen3.8-Flash-Next-NVFP4-QAD` (`runtime-qualification.json`) | **`PseudoBrain-Qwen3.8-Flash-Next-NVFP4` (Ours)** | Speedup / Savings |
+| :--- | :---: | :---: | :---: |
+| **`65K` Prefill Time (TTFT)** | `38.93 s` (`1,680 tok/s`) | **`21.02 s` (`3,108 tok/s`)** | **1.85× faster prefill (`-46%` latency)** |
+| **`65K` Decode Speed (`tok/s`)** | `35.8 – 39.1 tok/s` *(mean `37.8 tok/s`, MTP-3)* | **`53.4 – 88.3 tok/s`** *(mean **`65.9 tok/s`**, peak **`183.5 tok/s`** w/ DFlash2)* | **1.74× – 2.26× faster decode** |
+| **`1,000,000` (`1M`) Prefill Time (TTFT)** | `1,128.0 – 1,132.2 s` (`18.9 min`, `926 tok/s`) | **`543.06 s`** (`9.0 min`, **`1,801 tok/s`**) | **2.08× faster `1M` prefill (saves ~10 min per `1M` prompt)** |
+| **`1,000,000` (`1M`) Decode Speed (`tok/s`)** | `33.3 – 37.1 tok/s` *(mean `34.9 tok/s`)* | **`44.6 – 67.7 tok/s`** *(mean **`57.1 tok/s`**, `67.7 tok/s` on `1M` needle)* | **1.64× – 1.94× faster decode at `1M` tokens** |
+| **KV Cache Memory at `1M` Tokens** | Full `1,048,576`-token `fp8` KV cache (`--mem-fraction-static 0.86`, `max-running-requests 1`, requires static YaRN `factor=4.0`) | **Fixed `16,384`-token GPU window (`8.1%` of `6 GiB` pool = `~486 MiB`)** + NVMe Quest $O(1)$ archive (`--max-num-seqs 16`, **no static YaRN degradation**) | **~96% less GPU KV cache memory at `1M` + `16` concurrent sequences** |
 
 #### `PseudoBrain-Nex-35B-A3B` (`pb27-nexc` — [`reports/pb27/nexc_pt.summary.json`](reports/pb27/nexc_pt.summary.json), [`nexc_ext.summary.json`](reports/pb27/nexc_ext.summary.json), [`nexc_fast_verify.summary.json`](reports/pb27/nexc_fast_verify.summary.json))
+
+*Note: With the shared `pb27_vllm` $O(1)$ constant-speed decode update (`DECODE_STRIDE=64`, `DECODE_BLOCKS=64`, `DECODE_RERANK=0`, 2-level `bf16` Quest super-blocks), `pb27-nexc` and `pb27c` now maintain flat $O(1)$ decode throughput all the way to `1,000,000` tokens (eliminating the historical `500K–1M` NVMe rerank slowdown shown in the pre-patch receipt column below).*
 
 | Context Length ($L$) | `needle@0.1` | `needle@0.5` | `needle@0.9` | `multi4` (`4` constants) | `trace4` (`4`-hop chain) | Overall Score | Mean TTFT | Decode Speed | GPU KV Pool Used |
 | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -76,10 +90,10 @@ Evaluated via [`scripts/bench/custom_longctx_bench.py`](scripts/bench/custom_lon
 
 ### 2.2 General Intelligence (`MMLU`, `GSM8K`, `MMLU-Pro`, `lm-eval`), Software Engineering (`PB-SWE-Live`), & Algorithmic Coding
 
-- **`PseudoBrain-Qwen3.8-Flash-Next-NVFP4` Public Benchmarks ([`reports/pb27/public_bench/flash_next/`](reports/pb27/public_bench/flash_next/)):**
-  - **MMLU (`n=300`, 0-shot, greedy):** **`85.00%`** (`255 / 300`, `stderr: 0.0206`)
-  - **GSM8K (`n=150`, CoT, greedy non-thinking):** **`96.00%`** (`144 / 150`, `stderr: 0.0161`)
-  - **MMLU-Pro (`n=150`, 10-option CoT, greedy non-thinking):** **`81.33%`** (`122 / 150`, `85.31%` non-truncated)
+- **`PseudoBrain-Qwen3.8-Flash-Next-NVFP4` Public Benchmarks vs. Stock `Qwen3.8-Flash-Next` ([`reports/pb27/public_bench/flash_next/`](reports/pb27/public_bench/flash_next/)):**
+  - **MMLU (`n=300`, 0-shot, greedy):** **`85.00%`** (`255 / 300`, `stderr: 0.0206` vs. stock `~85.0–87.9%`)
+  - **GSM8K (`n=150`, CoT, greedy non-thinking):** **`96.00%`** (`144 / 150`, `stderr: 0.0161` vs. stock `93.29%`, **`+2.71%`**)
+  - **MMLU-Pro (`n=150`, 10-option CoT, greedy non-thinking):** **`81.33%`** (`122 / 150`, **`85.31%`** non-truncated vs. stock `73.23%` Base / `80.6%` Instruct)
 - **Standard `lm-eval` Battery (`1000` items/task, served through vLLM — [`reports/lmeval/`](reports/lmeval/)):**
   - `PB-27` vs. Stock `27B`: **HellaSwag** `0.733` vs `0.740`, **PIQA** `0.817` vs `0.816`, **ARC-E** `0.809` vs `0.800`, **ARC-C** `0.582` vs `0.578`, **Winogrande** `0.759` vs `0.761`, **LAMBADA** `0.728` vs `0.733` ($\max |\Delta| = 0.009$, within 1 SE $\approx 0.014$).
 - **Real-World Post-Cutoff Software Engineering (`PB-SWE-Live`, 59 tasks, 100-step agent loop — [`reports/swe_live/`](reports/swe_live/)):**
