@@ -174,6 +174,7 @@ class PB27Qwen4ExpNVFP4PLEEmbedding(nn.Module):
         )
         self._mmaps: list[mmap.mmap] = []
         self._keepalive: list[torch.Tensor] = []
+        self._tokens_seen: int = 0
         self._init_mmap_shards(model_path, prefix)
 
     def _init_mmap_shards(self, model_path: str, prefix: str) -> None:
@@ -285,6 +286,18 @@ class PB27Qwen4ExpNVFP4PLEEmbedding(nn.Module):
                 self.org_vocab_size,
                 num_warps=4,
             )
+            if n >= 1024:
+                self._tokens_seen += n
+                if self._tokens_seen >= 131072:
+                    self._tokens_seen = 0
+                    torch.cuda.current_stream().synchronize()
+                    for mm in self._mmaps:
+                        try:
+                            mm.madvise(mmap.MADV_DONTNEED)
+                        except OSError:
+                            pass
+                    if (torch.cuda.memory_reserved() - torch.cuda.memory_allocated()) > (2 << 30):
+                        torch.cuda.empty_cache()
         return out.view(*orig_shape, self.embedding_dim).to(self.params_dtype)
 
 

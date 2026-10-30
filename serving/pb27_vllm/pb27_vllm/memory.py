@@ -142,6 +142,17 @@ class Archive:
     cached_cu: tuple | None = None          # (t, w_len, p_len, cu_q, cu_w, cu_p) cached int32 cu_seqlens on GPU
     smax: torch.Tensor | None = None        # [KV, (cap // block + SBLK - 1) // SBLK, D] coarse bf16 super-block max
     smin: torch.Tensor | None = None        # [KV, (cap // block + SBLK - 1) // SBLK, D] coarse bf16 super-block min
+    mapped_files: list[tuple[int, mmap.mmap, int]] = field(default_factory=list)
+    last_evict_pos: int = 0
+
+    def evict_page_cache(self) -> None:
+        for fd, mm, nbytes in self.mapped_files:
+            try:
+                os.fdatasync(fd)
+                mm.madvise(mmap.MADV_DONTNEED)
+                os.posix_fadvise(fd, 0, nbytes, os.POSIX_FADV_DONTNEED)
+            except OSError:
+                pass
 
     @staticmethod
     def new(kv: int, d: int, cap: int, block: int, dtype, device, max_hint: int = 0) -> "Archive":
@@ -152,12 +163,15 @@ class Archive:
             arc_dtype = torch.float8_e4m3fn if NVME_DTYPE == "fp8" else dtype
             n_blk = cap // block
             n_sb = (n_blk + SBLK - 1) // SBLK
-            return Archive(_mapped(kv, big, d, arc_dtype), _mapped(kv, big, d, arc_dtype),
+            mk, mf_k = _mapped(kv, big, d, arc_dtype)
+            mv, mf_v = _mapped(kv, big, d, arc_dtype)
+            return Archive(mk, mv,
                            torch.empty(kv, n_blk, d, dtype=b_dtype, device=device),
                            torch.empty(kv, n_blk, d, dtype=b_dtype, device=device),
                            mapped=True,
                            smax=torch.empty(kv, n_sb, d, dtype=b_dtype, device=device),
-                           smin=torch.empty(kv, n_sb, d, dtype=b_dtype, device=device))
+                           smin=torch.empty(kv, n_sb, d, dtype=b_dtype, device=device),
+                           mapped_files=[mf_k, mf_v])
         if OFFLOAD == "nvme":
             cap = min(max(cap, -(-max_hint // block) * block), gpu_cap)
             n_blk = cap // block
@@ -192,7 +206,8 @@ class Archive:
         if OFFLOAD == "nvme" and not self.mapped and need > gpu_cap:
             big = max(new_cap, -(-NVME_CAP // block) * block)
             arc_dtype = torch.float8_e4m3fn if NVME_DTYPE == "fp8" else self.keys.dtype
-            mk, mv = _mapped(kv, big, d, arc_dtype), _mapped(kv, big, d, arc_dtype)
+            mk, mf_k = _mapped(kv, big, d, arc_dtype)
+            mv, mf_v = _mapped(kv, big, d, arc_dtype)
             if self.size > 0:
                 mk[:, :self.size] = self.keys[:, :self.size].to(device=mk.device, dtype=arc_dtype)
                 mv[:, :self.size] = self.values[:, :self.size].to(device=mv.device, dtype=arc_dtype)
@@ -201,6 +216,7 @@ class Archive:
                     self.sink_k = self.keys[:, :s_end].transpose(0, 1).contiguous()
                     self.sink_v = self.values[:, :s_end].transpose(0, 1).contiguous()
             self.keys, self.values, self.mapped = mk, mv, True
+            self.mapped_files = [mf_k, mf_v]
             new_cap = min(new_cap, self.keys.shape[1] // block * block)
         elif self.mapped:
             if need > self.keys.shape[1]:
@@ -308,6 +324,9 @@ class Archive:
             self.keys[:, p_idx] = kt.to(device=self.keys.device, dtype=self.keys.dtype)
             self.values[:, p_idx] = vt.to(device=self.values.device, dtype=self.values.dtype)
         self.size = max(self.size, hi)
+        if self.mapped and self.size - self.last_evict_pos >= 131072:
+            self.evict_page_cache()
+            self.last_evict_pos = self.size
         if hi - 1 < ORIGIN:
             return
         lo_b, hi_b = max(0, p0 - ORIGIN) // block, (hi - 1 - ORIGIN) // block
@@ -379,37 +398,37 @@ def _copy_d2h_staged(dst_k: torch.Tensor, dst_v: torch.Tensor, kt: torch.Tensor,
     dst_v.copy_(sv)
 
 
-def _mapped(kv: int, cap: int, d: int, dtype) -> torch.Tensor:
-    """[kv, cap, d] demand-paged tensor (anonymous mmap by default, or unlinked sparse file when NVME_DIR is set)."""
-    pool_key = (kv, cap, d, dtype)
-    bucket = _MMAP_POOL.get(pool_key)
-    if bucket:
-        return bucket.pop()
+def _mapped(kv: int, cap: int, d: int, dtype) -> tuple[torch.Tensor, tuple[int, mmap.mmap, int]]:
+    """[kv, cap, d] tensor backed by an unlinked sparse file; only touched pages use disk or evictable page cache."""
     nbytes = kv * cap * d * torch.empty(0, dtype=dtype).element_size()
-    if NVME_DIR:
-        fd, path = tempfile.mkstemp(dir=NVME_DIR, prefix="pb27_arc_")
-        try:
-            os.unlink(path)
-            os.ftruncate(fd, nbytes)
-            mm = mmap.mmap(fd, nbytes)
-        finally:
-            os.close(fd)
-    else:
-        mm = mmap.mmap(-1, nbytes)
-    return torch.frombuffer(mm, dtype=torch.uint8).view(dtype).view(kv, cap, d)
+    target_dir = NVME_DIR if (NVME_DIR and os.path.isdir(NVME_DIR)) else None
+    fd, path = tempfile.mkstemp(dir=target_dir, prefix="pb27_arc_")
+    try:
+        os.unlink(path)
+        os.ftruncate(fd, nbytes)
+        mm = mmap.mmap(fd, nbytes)
+    except Exception:
+        os.close(fd)
+        raise
+    return torch.frombuffer(mm, dtype=torch.uint8).view(dtype).view(kv, cap, d), (fd, mm, nbytes)
 
 
 def _free(archives) -> None:
     for arc in archives.values():
-        if getattr(arc, "mapped", False):
-            for t in (arc.keys, arc.values):
-                if t is not None and t.device.type == "cpu":
-                    pool_key = (t.shape[0], t.shape[1], t.shape[2], t.dtype)
-                    bucket = _MMAP_POOL.setdefault(pool_key, [])
-                    if len(bucket) < _MMAP_POOL_MAX:
-                        bucket.append(t)
+        for fd, mm, nbytes in getattr(arc, "mapped_files", ()):
+            try:
+                mm.madvise(mmap.MADV_DONTNEED)
+                os.posix_fadvise(fd, 0, nbytes, os.POSIX_FADV_DONTNEED)
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if hasattr(arc, "mapped_files"):
+            arc.mapped_files.clear()
     archives.clear()
-    if torch.cuda.is_available() and (torch.cuda.memory_reserved() - torch.cuda.memory_allocated()) > (8 << 30):
+    if torch.cuda.is_available() and (torch.cuda.memory_reserved() - torch.cuda.memory_allocated()) > (2 << 30):
         torch.cuda.empty_cache()
 
 
