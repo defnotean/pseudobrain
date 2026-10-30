@@ -39,24 +39,25 @@ def _reposition_rope_blocks(
         return rk
     d_rot = d // 4
     half = d_rot // 2
-    idx = blk_idx.to(device=rk.device, dtype=torch.long).clone()
-    if n_blk > 1:
-        is_succ = torch.zeros_like(idx, dtype=torch.bool)
-        is_succ[:, :, 1:] = idx[:, :, 1:] == (idx[:, :, :-1] + 1)
-        step = 1
-        while step < n_blk:
-            prev_idx = torch.roll(idx, shifts=step, dims=2)
-            prev_succ = torch.roll(is_succ, shifts=step, dims=2)
-            prev_succ[:, :, :step] = False
-            idx = torch.where(is_succ, prev_idx, idx)
-            is_succ = is_succ & prev_succ
-            if not bool(is_succ.any()):
-                break
-            step *= 2
+    idx = blk_idx.to(device=rk.device, dtype=torch.long)
     orig_pos = (idx * block).to(torch.float32)
-    scale = 1.0 - min(1.0, float(arc_span) / float(max(1, ref_pos)))
-    max_shift = (float(max(0, ref_pos - 2 * block)) - orig_pos).clamp(min=0.0)
-    delta = torch.minimum(torch.round((float(ref_pos) - orig_pos).clamp(min=0.0) * scale), max_shift)
+    end_pos = float(max(0, ref_pos - 2 * block))
+    if span == 0:
+        target_pos = torch.full_like(orig_pos, end_pos)
+    else:
+        if n_blk > 1:
+            diff = idx[:, :, 1:] - idx[:, :, :-1]
+            step = torch.where(
+                diff <= 0,
+                torch.zeros_like(diff),
+                torch.where(diff == 1, torch.full_like(diff, block), torch.full_like(diff, 2 * block)),
+            )
+            rel_from_end = torch.zeros_like(idx)
+            rel_from_end[:, :, :-1] = torch.cumsum(step.flip(2), dim=2).flip(2)
+        else:
+            rel_from_end = torch.zeros_like(idx)
+        target_pos = (end_pos - rel_from_end.to(torch.float32)).clamp(min=0.0)
+    delta = target_pos - orig_pos
     inv_freq = 1.0 / (theta ** (torch.arange(0, d_rot, 2, device=rk.device, dtype=torch.float32) / float(d_rot)))
     angles = delta.unsqueeze(-1) * inv_freq
     cos, sin = angles.cos().unsqueeze(3), angles.sin().unsqueeze(3)

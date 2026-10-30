@@ -545,25 +545,24 @@ def _reposition_rope_blocks(
     if half <= 0:
         return rk
     idx = blk_idx.to(device=rk.device, dtype=torch.long)
-    if contiguous_runs and n_blk > 1:
-        idx = idx.clone()
-        is_succ = torch.zeros_like(idx, dtype=torch.bool)
-        is_succ[:, 1:] = idx[:, 1:] == (idx[:, :-1] + 1)
-        step = 1
-        while step < n_blk:
-            prev_idx = torch.roll(idx, shifts=step, dims=1)
-            prev_succ = torch.roll(is_succ, shifts=step, dims=1)
-            prev_succ[:, :step] = False
-            idx = torch.where(is_succ, prev_idx, idx)
-            is_succ = is_succ & prev_succ
-            if not bool(is_succ.any()):
-                break
-            step *= 2
     orig_pos = (ORIGIN + idx * block).to(torch.float32)
-    arc_span = ROPE_ARC_SPAN if span is None else span
-    scale = 1.0 - min(1.0, float(arc_span) / float(max(1, ref_pos)))
-    max_shift = (float(max(0, ref_pos - 2 * block)) - orig_pos).clamp(min=0.0)
-    delta = torch.minimum(torch.round((float(ref_pos) - orig_pos).clamp(min=0.0) * scale), max_shift)
+    end_pos = float(max(0, ref_pos - 2 * block))
+    if span == 0 or not contiguous_runs:
+        target_pos = torch.full_like(orig_pos, end_pos)
+    else:
+        if n_blk > 1:
+            diff = idx[:, 1:] - idx[:, :-1]
+            step = torch.where(
+                diff <= 0,
+                torch.zeros_like(diff),
+                torch.where(diff == 1, torch.full_like(diff, block), torch.full_like(diff, 2 * block)),
+            )
+            rel_from_end = torch.zeros_like(idx)
+            rel_from_end[:, :-1] = torch.cumsum(step.flip(1), dim=1).flip(1)
+        else:
+            rel_from_end = torch.zeros_like(idx)
+        target_pos = (end_pos - rel_from_end.to(torch.float32)).clamp(min=0.0)
+    delta = target_pos - orig_pos
     inv_freq = _get_rope_inv_freq(rk.device, d_rot)
     angles = delta.unsqueeze(-1) * inv_freq
     cos = angles.cos().unsqueeze(2)
@@ -580,7 +579,7 @@ def _reposition_rope_blocks(
 
 
 def _reposition_rope_sinks(sk: torch.Tensor, block: int, ref_pos: int) -> torch.Tensor:
-    """Shift the `ns` sink tokens `0..ns-1` to `ref_pos - ROPE_ARC_SPAN - block + (0..ns-1)` when `ref_pos > ROPE_HORIZON`."""
+    """Shift the `ns` sink tokens `0..ns-1` to `ref_pos - 65536 - block + (0..ns-1)` when `ref_pos > ROPE_HORIZON`."""
     if ROPE_HORIZON <= 0 or ref_pos <= ROPE_HORIZON or sk.numel() == 0:
         return sk
     d = sk.shape[-1]
@@ -588,7 +587,7 @@ def _reposition_rope_sinks(sk: torch.Tensor, block: int, ref_pos: int) -> torch.
     half = d_rot // 2
     if half <= 0:
         return sk
-    shift = float(max(0, ref_pos - ROPE_ARC_SPAN - block))
+    shift = float(max(0, ref_pos - 65536 - block))
     inv_freq = _get_rope_inv_freq(sk.device, d_rot)
     angles = shift * inv_freq
     cos = angles.cos().view(1, 1, half)
