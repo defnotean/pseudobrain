@@ -70,6 +70,24 @@ class Handler(BaseHTTPRequestHandler):
                     if "model" in body:
                         body["model"] = ARGS.model
                     body.pop("pseudobrain_mode", None)  # old-server extra rejected by vLLM; keep tools/tool_choice for OpenCode & Studio
+                    if self.path.startswith("/v1/chat/completions"):
+                        ctk = body.setdefault("chat_template_kwargs", {})
+                        if isinstance(ctk, dict):
+                            ctk.setdefault("preserve_thinking", False)
+                            if body.get("tools"):
+                                ctk.setdefault("reasoning_effort", "medium")
+                        msgs = body.get("messages")
+                        if isinstance(msgs, list) and len(msgs) > 2:
+                            for m in msgs[:-2]:
+                                if isinstance(m, dict) and m.get("role") == "assistant":
+                                    m.pop("reasoning_content", None)
+                                    m.pop("reasoning", None)
+                            if len(msgs) > 8:
+                                for m in msgs[:-8]:
+                                    if isinstance(m, dict) and m.get("role") == "tool":
+                                        c = m.get("content")
+                                        if isinstance(c, str) and len(c) > 6000:
+                                            m["content"] = c[:2500] + "\n...[older tool output compacted]...\n" + c[-2500:]
                 raw = json.dumps(body).encode()
             except ValueError:
                 pass
