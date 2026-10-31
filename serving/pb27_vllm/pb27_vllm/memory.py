@@ -77,6 +77,12 @@ DECODE_STRIDE = int(os.environ.get("PB27_MEMORY_DECODE_STRIDE", "64") or 64)
 DECODE_BLOCKS = int(os.environ.get("PB27_MEMORY_DECODE_BLOCKS", "64") or 64)
 DECODE_RERANK = os.environ.get("PB27_MEMORY_DECODE_RERANK", "0") == "1"
 SBLK = int(os.environ.get("PB27_MEMORY_SUPERBLOCK", "64") or 64)
+# Dense Global Aggregation ("auto", "1", or "0"): detects high-entropy global queries across the archive and activates
+# (1) stratified super-block timeline coverage, (2) novelty-rotating decode working sets across decode steps, and
+# (3) resident super-block summary KV landmarks (`smean_k` / `smean_v`, 1 summary token per 4,096 tokens).
+GLOBAL_AGG = os.environ.get("PB27_MEMORY_GLOBAL_AGG", "auto").strip().lower()
+GLOBAL_DECODE_STRIDE = int(os.environ.get("PB27_MEMORY_GLOBAL_DECODE_STRIDE", "16") or 16)
+NOVELTY_ALPHA = float(os.environ.get("PB27_MEMORY_NOVELTY_ALPHA", "0.75") or 0.75)
 LAYER_STRIDE = int(os.environ.get("PB27_MEMORY_LAYER_STRIDE", "1") or 1)
 GPU_ARC_CAP = int(os.environ.get("PB27_MEMORY_GPU_ARC_CAP", "262144") or 262144)
 QBUF_CAP = 256
@@ -88,7 +94,7 @@ PROMPT_LENS: dict[str, int] = globals().get("PROMPT_LENS", {})           # req_i
 ARCHIVES: dict[tuple[str, str], "Archive"] = globals().get("ARCHIVES", {})  # (req_id, layer_name) -> Archive
 STATS: dict = globals().get("STATS", {"calls": 0, "fallback": 0, "retrievals": 0, "pieces": 0, "tokens_archived": 0,
                "adopt_full": 0, "adopt_partial": 0, "adopt_none": 0, "hole_skips": 0,
-               "pertoken": 0, "pertoken_capped": 0})
+               "pertoken": 0, "pertoken_capped": 0, "global_agg": 0})
 # Prefix caching: vLLM skips computing the cached prefix of a new request, so the archive of the request that
 # produced that prefix is retained after it finishes and adopted by the next request whose tokens match it.
 RETAIN = int(os.environ.get("PB27_MEMORY_RETAIN", "0") or 0)   # max retired archive sets kept (0 = off)
@@ -147,6 +153,12 @@ class Archive:
     cached_cu: tuple | None = None          # (t, w_len, p_len, cu_q, cu_w, cu_p) cached int32 cu_seqlens on GPU
     smax: torch.Tensor | None = None        # [KV, (cap // block + SBLK - 1) // SBLK, D] coarse bf16 super-block max
     smin: torch.Tensor | None = None        # [KV, (cap // block + SBLK - 1) // SBLK, D] coarse bf16 super-block min
+    bmean_k: torch.Tensor | None = None     # [KV, cap // block, D] per-block mean key on GPU for hierarchical summaries
+    bmean_v: torch.Tensor | None = None     # [KV, cap // block, D] per-block mean value on GPU for hierarchical summaries
+    smean_k: torch.Tensor | None = None     # [KV, n_sb, D] coarse super-block summary key landmarks on GPU
+    smean_v: torch.Tensor | None = None     # [KV, n_sb, D] coarse super-block summary value landmarks on GPU
+    visit_counts: torch.Tensor | None = None  # [KV, cap // block] int16 decode visit counts for novelty sweeping
+    is_global_agg: bool = False             # True when Dense Global Aggregation mode is active for this request
     mapped_files: list[tuple[int, mmap.mmap, int]] = field(default_factory=list)
     last_evict_pos: int = 0
 
@@ -176,6 +188,10 @@ class Archive:
                            mapped=True,
                            smax=torch.empty(kv, n_sb, d, dtype=b_dtype, device=device),
                            smin=torch.empty(kv, n_sb, d, dtype=b_dtype, device=device),
+                           bmean_k=torch.zeros(kv, n_blk, d, dtype=b_dtype, device=device),
+                           bmean_v=torch.zeros(kv, n_blk, d, dtype=b_dtype, device=device),
+                           smean_k=torch.zeros(kv, n_sb, d, dtype=b_dtype, device=device),
+                           smean_v=torch.zeros(kv, n_sb, d, dtype=b_dtype, device=device),
                            mapped_files=[mf_k, mf_v])
         if OFFLOAD == "nvme":
             cap = min(max(cap, -(-max_hint // block) * block), gpu_cap)
@@ -187,7 +203,11 @@ class Archive:
                            torch.empty(kv, n_blk, d, dtype=b_dtype, device=device),
                            mapped=False,
                            smax=torch.empty(kv, n_sb, d, dtype=b_dtype, device=device),
-                           smin=torch.empty(kv, n_sb, d, dtype=b_dtype, device=device))
+                           smin=torch.empty(kv, n_sb, d, dtype=b_dtype, device=device),
+                           bmean_k=torch.zeros(kv, n_blk, d, dtype=b_dtype, device=device),
+                           bmean_v=torch.zeros(kv, n_blk, d, dtype=b_dtype, device=device),
+                           smean_k=torch.zeros(kv, n_sb, d, dtype=b_dtype, device=device),
+                           smean_v=torch.zeros(kv, n_sb, d, dtype=b_dtype, device=device))
         kv_dev = torch.device("cpu") if "cpu" in OFFLOAD else device
         kv_dtype = torch.float8_e4m3fn if "fp8" in OFFLOAD else dtype
         n_blk = cap // block
@@ -197,7 +217,11 @@ class Archive:
                        torch.empty(kv, n_blk, d, dtype=b_dtype, device=device),
                        torch.empty(kv, n_blk, d, dtype=b_dtype, device=device),
                        smax=torch.empty(kv, n_sb, d, dtype=b_dtype, device=device),
-                       smin=torch.empty(kv, n_sb, d, dtype=b_dtype, device=device))
+                       smin=torch.empty(kv, n_sb, d, dtype=b_dtype, device=device),
+                       bmean_k=torch.zeros(kv, n_blk, d, dtype=b_dtype, device=device),
+                       bmean_v=torch.zeros(kv, n_blk, d, dtype=b_dtype, device=device),
+                       smean_k=torch.zeros(kv, n_sb, d, dtype=b_dtype, device=device),
+                       smean_v=torch.zeros(kv, n_sb, d, dtype=b_dtype, device=device))
 
     def grow(self, need: int, block: int) -> None:
         cap = self.kmax.shape[1] * block if self.mapped else self.keys.shape[1]
@@ -236,16 +260,21 @@ class Archive:
                 buf[:, :cap] = old
                 setattr(self, name, buf)
         new_n_blk = new_cap // block
-        for name in ("kmax", "kmin"):
-            old = getattr(self, name)
-            buf = torch.empty(kv, new_n_blk, d, dtype=old.dtype, device=old.device)
-            buf[:, : cap // block] = old
-            setattr(self, name, buf)
+        for name in ("kmax", "kmin", "bmean_k", "bmean_v"):
+            old = getattr(self, name, None)
+            if old is not None:
+                buf = torch.zeros(kv, new_n_blk, d, dtype=old.dtype, device=old.device)
+                buf[:, : old.shape[1]] = old
+                setattr(self, name, buf)
+        if self.visit_counts is not None and self.visit_counts.shape[1] < new_n_blk:
+            vc = torch.zeros(kv, new_n_blk, dtype=self.visit_counts.dtype, device=self.visit_counts.device)
+            vc[:, : self.visit_counts.shape[1]] = self.visit_counts
+            self.visit_counts = vc
         new_n_sb = (new_n_blk + SBLK - 1) // SBLK
-        for name in ("smax", "smin"):
+        for name in ("smax", "smin", "smean_k", "smean_v"):
             old = getattr(self, name, None)
             if old is not None and old.shape[1] < new_n_sb:
-                buf = torch.empty(kv, new_n_sb, d, dtype=old.dtype, device=old.device)
+                buf = torch.zeros(kv, new_n_sb, d, dtype=old.dtype, device=old.device)
                 buf[:, : old.shape[1]] = old
                 setattr(self, name, buf)
 
@@ -264,11 +293,19 @@ class Archive:
             n_full = full_sb_end - sb0
             self.smax[:, sb0:full_sb_end] = self.kmax[:, b0:b1].view(kv, n_full, SBLK, d).amax(2)
             self.smin[:, sb0:full_sb_end] = self.kmin[:, b0:b1].view(kv, n_full, SBLK, d).amin(2)
+            if self.bmean_k is not None and self.smean_k is not None:
+                self.smean_k[:, sb0:full_sb_end] = self.bmean_k[:, b0:b1].view(kv, n_full, SBLK, d).mean(2).to(self.smean_k.dtype)
+            if self.bmean_v is not None and self.smean_v is not None:
+                self.smean_v[:, sb0:full_sb_end] = self.bmean_v[:, b0:b1].view(kv, n_full, SBLK, d).mean(2).to(self.smean_v.dtype)
         for sb in range(max(sb0, full_sb_end), sb1 + 1):
             b0, b1 = sb * SBLK, min(n_blk, (sb + 1) * SBLK)
             if b1 > b0:
                 self.smax[:, sb] = self.kmax[:, b0:b1].amax(1)
                 self.smin[:, sb] = self.kmin[:, b0:b1].amin(1)
+                if self.bmean_k is not None and self.smean_k is not None:
+                    self.smean_k[:, sb] = self.bmean_k[:, b0:b1].mean(1).to(self.smean_k.dtype)
+                if self.bmean_v is not None and self.smean_v is not None:
+                    self.smean_v[:, sb] = self.bmean_v[:, b0:b1].mean(1).to(self.smean_v.dtype)
 
     def write(self, pos: torch.Tensor, k: torch.Tensor, v: torch.Tensor, block: int,
               p0: int | None = None, hi: int | None = None) -> None:
@@ -315,8 +352,13 @@ class Archive:
                 s0 = ORIGIN + b_start * block - p0
                 s1 = ORIGIN + b_end * block - p0
                 k_full = kt[:, s0:s1].view(kt.shape[0], b_end - b_start, block, kt.shape[2])
+                v_full = vt[:, s0:s1].view(vt.shape[0], b_end - b_start, block, vt.shape[2])
                 self.kmax[:, b_start:b_end] = k_full.amax(2).to(self.kmax.dtype)
                 self.kmin[:, b_start:b_end] = k_full.amin(2).to(self.kmin.dtype)
+                if self.bmean_k is not None:
+                    self.bmean_k[:, b_start:b_end] = k_full.mean(2).to(self.bmean_k.dtype)
+                if self.bmean_v is not None:
+                    self.bmean_v[:, b_start:b_end] = v_full.mean(2).to(self.bmean_v.dtype)
                 fast_bounds = True
         if contig:
             if self.keys.device.type == "cpu" and kt.is_cuda and self.keys.dtype == kt.dtype and n <= 8192:
@@ -362,14 +404,23 @@ class Archive:
             return
         if self.gpu_k is not None and lo >= self.gpu_lo and hi <= self.gpu_hi:
             seg = self.gpu_k[lo - self.gpu_lo : hi - self.gpu_lo].transpose(0, 1).float()
+            seg_v = self.gpu_v[lo - self.gpu_lo : hi - self.gpu_lo].transpose(0, 1).float() if self.gpu_v is not None else None
         else:
             seg = self.keys[:, lo:hi].to(device=self.kmax.device).float()
+            seg_v = self.values[:, lo:hi].to(device=self.kmax.device).float() if self.bmean_v is not None else None
         pad = (-seg.shape[1]) % block
         if pad:
             seg = torch.cat((seg, seg[:, -1:].expand(-1, pad, -1)), dim=1)
+            if seg_v is not None:
+                seg_v = torch.cat((seg_v, seg_v[:, -1:].expand(-1, pad, -1)), dim=1)
         blocks = seg.view(seg.shape[0], -1, block, seg.shape[2])
         self.kmax[:, lo_b: lo_b + blocks.shape[1]] = blocks.amax(2).to(self.kmax.dtype)
         self.kmin[:, lo_b: lo_b + blocks.shape[1]] = blocks.amin(2).to(self.kmin.dtype)
+        if self.bmean_k is not None:
+            self.bmean_k[:, lo_b: lo_b + blocks.shape[1]] = blocks.mean(2).to(self.bmean_k.dtype)
+        if self.bmean_v is not None and seg_v is not None:
+            blocks_v = seg_v.view(seg_v.shape[0], -1, block, seg_v.shape[2])
+            self.bmean_v[:, lo_b: lo_b + blocks_v.shape[1]] = blocks_v.mean(2).to(self.bmean_v.dtype)
 
     def refresh_bounds(self, block: int) -> None:
         if self.dirty_hi < self.dirty_lo:
@@ -520,9 +571,15 @@ def _get_rope_inv_freq(device: torch.device, d_rot: int) -> torch.Tensor:
     return inv_freq
 
 
-def _reposition_rope_sinks(sk: torch.Tensor, ref_pos: int, span: int | None = None) -> torch.Tensor:
-    """Reposition the sink keys `sk` [KV, ns, D] from original positions `0..ns-1` to sit immediately before the
-    repositioned archive span `[ref_pos - ROPE_ARC_SPAN, ref_pos)` when `ref_pos > ROPE_HORIZON`."""
+def _reposition_rope_sinks(
+    sk: torch.Tensor,
+    ref_pos: int,
+    span: int | None = None,
+    n_blk: int = 0,
+    block: int = 64,
+) -> torch.Tensor:
+    """Reposition the sink keys `sk` [KV, ns, D] from original positions `0..ns-1` to `[base_start - ns, base_start)`,
+    strictly before the earliest repositioned archive block `[base_start, ref_pos)` when `ref_pos > ROPE_HORIZON`."""
     if ROPE_HORIZON <= 0 or ref_pos <= ROPE_HORIZON or sk.numel() == 0:
         return sk
     kv, ns, d = sk.shape
@@ -530,8 +587,10 @@ def _reposition_rope_sinks(sk: torch.Tensor, ref_pos: int, span: int | None = No
     half = d_rot // 2
     if half <= 0:
         return sk
-    arc_span = ROPE_ARC_SPAN if span is None else span
-    delta_val = float(max(0, ref_pos - arc_span - ORIGIN))
+    arc_span = ROPE_ARC_SPAN if (span is None or span <= 0) else span
+    eff_span = max(arc_span, n_blk * block)
+    base_start = max(ORIGIN, ref_pos - eff_span)
+    delta_val = float(max(0, base_start - ns))
     if delta_val <= 0.0:
         return sk
     inv_freq = _get_rope_inv_freq(sk.device, d_rot)
@@ -557,12 +616,17 @@ def _reposition_rope_blocks(
     span: int | None = None,
     prio_rank: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Compress archived-block rotary positions into `[ref_pos - ROPE_ARC_SPAN, ref_pos)` when `ref_pos > ROPE_HORIZON`.
+    """Piecewise-Proportional, Strictly Non-Overlapping Block RoPE into `[ref_pos - eff_span, ref_pos)`.
 
-    Because 2D Neox-style RoPE is an abelian group (`RoPE(RoPE(k, p), delta) = RoPE(k, p + delta)`), rotating all
-    `block` tokens of block `b` by the same shift `delta_b` preserves exact `+1` relative token offsets inside each
-    block, and assigning the same `delta_b` across contiguous block runs `[b, b + 1, ...]` preserves exact `+1`
-    relative token offsets across block boundaries without cross-head rotary drift.
+    Guarantees three simultaneous invariants when `ref_pos > ROPE_HORIZON`:
+    1. Exact Intra-Block & Contiguous-Run Continuity: All `block` tokens inside block `b` rotate by the same shift
+       `delta_b` (preserving exact `+1` local steps), and contiguous blocks `b_j = b_{j-1} + 1` have inter-block
+       historical gap `g_mid = 0`, receiving the exact same `delta` across the block boundary.
+    2. Strict Chronological Non-Overlap: Every block `j` is allocated a mandatory `block`-token footprint plus its
+       proportional share of the remaining RoPE slack, guaranteeing `T(b_j) >= T(b_{j-1}) + block` so nearby
+       non-adjacent blocks (`b_j = b_{j-1} + 2`) never invert or overlap in rotary phase space.
+    3. Proportional Macro-Timeline Preservation: True historical gaps `g_j = (b_j - b_{j-1} - 1) * block` scale
+       proportionally across the `ROPE_ARC_SPAN` horizon instead of flattening relative timeline distances.
     """
     if ROPE_HORIZON <= 0 or ref_pos <= ROPE_HORIZON or rk.numel() == 0:
         return rk
@@ -575,27 +639,28 @@ def _reposition_rope_blocks(
     if half <= 0:
         return rk
     idx = blk_idx.to(device=rk.device, dtype=torch.long)
-    arc_span = ROPE_ARC_SPAN if span is None else span
-    if contiguous_runs and arc_span > 0 and n_blk > 1:
-        is_succ = torch.zeros_like(idx, dtype=torch.bool)
-        is_succ[:, 1:] = idx[:, 1:] == (idx[:, :-1] + 1)
-        if prio_rank is not None and prio_rank.shape == idx.shape:
-            pr = prio_rank.to(device=idx.device)
-            is_succ[:, 1:] = is_succ[:, 1:] & ((pr[:, 1:] > pr[:, :-1]) | (pr[:, :-1] < 128))
-        step = 1
-        while step < n_blk:
-            prev_idx = torch.cat((idx[:, :step], idx[:, :-step]), dim=1)
-            prev_succ = torch.cat((torch.zeros_like(is_succ[:, :step]), is_succ[:, :-step]), dim=1)
-            idx = torch.where(is_succ, prev_idx, idx)
-            is_succ = is_succ & prev_succ
-            step <<= 1
+    arc_span = ROPE_ARC_SPAN if (span is None or span <= 0) else span
     orig_pos = (ORIGIN + idx * block).to(torch.float32)
-    if arc_span == 0 or not contiguous_runs:
-        end_pos = float(max(0, ref_pos - 2 * block))
-        delta = (end_pos - orig_pos).clamp(min=0.0)
-    else:
+    if not contiguous_runs:
         scale = 1.0 - min(1.0, float(arc_span) / float(max(1, ref_pos)))
         target_pos = orig_pos + torch.round((float(ref_pos) - orig_pos).clamp(min=0.0) * scale)
+        delta = (target_pos - orig_pos).clamp(min=0.0)
+    else:
+        eff_span = max(arc_span, n_blk * block)
+        base_start = float(max(ORIGIN, ref_pos - eff_span))
+        slack = float(max(0.0, (ref_pos - base_start) - n_blk * block))
+        g_pre = (orig_pos[:, :1] - float(ORIGIN)).clamp(min=0.0)
+        if n_blk > 1:
+            g_mid = ((idx[:, 1:] - idx[:, :-1] - 1).clamp(min=0) * block).to(torch.float32)
+            g_cum = torch.cat((g_pre, g_pre + torch.cumsum(g_mid, dim=1)), dim=1)
+            g_mid_sum = g_mid.sum(dim=1, keepdim=True)
+        else:
+            g_cum = g_pre
+            g_mid_sum = torch.zeros_like(g_pre)
+        g_post = (float(ref_pos) - (orig_pos[:, -1:] + float(block))).clamp(min=0.0)
+        g_tot = (g_pre + g_mid_sum + g_post).clamp(min=1.0)
+        j_steps = (torch.arange(n_blk, device=rk.device, dtype=torch.float32) * float(block)).unsqueeze(0)
+        target_pos = base_start + j_steps + torch.round(g_cum * (slack / g_tot))
         delta = (target_pos - orig_pos).clamp(min=0.0)
     inv_freq = _get_rope_inv_freq(rk.device, d_rot)
     angles = delta.unsqueeze(-1) * inv_freq
@@ -610,6 +675,40 @@ def _reposition_rope_blocks(
     out[..., :half] = r1
     out[..., half:d_rot] = r2
     return out.view(kv, total_t, d)
+
+
+def _reposition_rope_landmarks(
+    smk: torch.Tensor,
+    block: int,
+    ref_pos: int,
+    span: int | None = None,
+) -> torch.Tensor:
+    """Reposition super-block centroid landmark keys `smk` [KV, n_sb, D] proportionally into `[ref_pos - arc_span, ref_pos)`."""
+    if ROPE_HORIZON <= 0 or ref_pos <= ROPE_HORIZON or smk.numel() == 0:
+        return smk
+    kv, n_sb, d = smk.shape
+    d_rot = d // 4
+    half = d_rot // 2
+    if half <= 0:
+        return smk
+    arc_span = ROPE_ARC_SPAN if (span is None or span <= 0) else span
+    sb_stride = float(SBLK * block)
+    orig_pos = float(ORIGIN) + (torch.arange(n_sb, device=smk.device, dtype=torch.float32) + 0.5) * sb_stride
+    scale = 1.0 - min(1.0, float(arc_span) / float(max(1, ref_pos)))
+    target_pos = orig_pos + torch.round((float(ref_pos) - orig_pos).clamp(min=0.0) * scale)
+    delta = (target_pos - orig_pos).clamp(min=0.0).unsqueeze(0)  # [1, n_sb]
+    inv_freq = _get_rope_inv_freq(smk.device, d_rot)
+    angles = delta.unsqueeze(-1) * inv_freq  # [1, n_sb, half]
+    cos = angles.cos()
+    sin = angles.sin()
+    x1 = smk[..., :half].float()
+    x2 = smk[..., half:d_rot].float()
+    r1 = (x1 * cos - x2 * sin).to(smk.dtype)
+    r2 = (x2 * cos + x1 * sin).to(smk.dtype)
+    out = smk.clone()
+    out[..., :half] = r1
+    out[..., half:d_rot] = r2
+    return out
 
 
 def _gather_blocks(t: torch.Tensor, blk_idx: torch.Tensor, block: int) -> torch.Tensor:
@@ -861,18 +960,66 @@ def _second_hop_blocks(arc: Archive, blk_ord: torch.Tensor, full: int, n_valid: 
     return cand2.gather(-1, keep2)
 
 
+def _detect_global_agg(z_raw: torch.Tensor, full: int) -> bool:
+    """Detect Dense Global Aggregation queries (high participation ratio across the archived timeline)."""
+    if GLOBAL_AGG in ("0", "false", "off", "no"):
+        return False
+    if GLOBAL_AGG in ("1", "true", "on", "yes", "force"):
+        return True
+    if full < 128:
+        return False
+    z_tail = z_raw[:, -min(z_raw.shape[1], 16):].amax(1)  # [KV, full]
+    z_1d = (z_tail - z_tail.mean(-1, keepdim=True)) / z_tail.std(-1, keepdim=True).clamp(min=1e-6)
+    pos_mass = (z_1d - 1.0).clamp(min=0.0)
+    l1 = pos_mass.sum(dim=-1)
+    l2_sq = (pos_mass * pos_mass).sum(dim=-1).clamp(min=1e-6)
+    n_eff = float((l1 * l1 / l2_sq).mean().item())
+    z_peak = float(z_1d.amax().item())
+    return n_eff > max(64.0, 0.12 * float(full)) and z_peak < 4.5
+
+
+def _stratified_superblock_peaks(score_1d: torch.Tensor, full: int, max_sb: int) -> torch.Tensor:
+    """Pick the highest-scoring block inside each uniform timeline segment across `[0, full)` -> `[KV, n_seg]`."""
+    kv = score_1d.shape[0]
+    n_seg = min(max(1, max_sb), full // max(1, SBLK))
+    if n_seg <= 1:
+        return score_1d.argmax(dim=-1, keepdim=True)
+    seg_len = full // n_seg
+    usable = n_seg * seg_len
+    s_seg = score_1d[:, :usable].view(kv, n_seg, seg_len)
+    local_best = s_seg.argmax(dim=-1)
+    seg_base = (torch.arange(n_seg, device=score_1d.device, dtype=local_best.dtype) * seg_len).unsqueeze(0)
+    return seg_base + local_best
+
+
+def _record_block_visits(arc: Archive, blk: torch.Tensor, full: int) -> None:
+    """Increment per-block decode visit counts for novelty-penalized global aggregation sweeps."""
+    kv = blk.shape[0]
+    cap_blk = arc.kmax.shape[1]
+    if arc.visit_counts is None or arc.visit_counts.shape[1] < cap_blk:
+        vc = torch.zeros(kv, cap_blk, dtype=torch.int16, device=blk.device)
+        if arc.visit_counts is not None:
+            vc[:, : arc.visit_counts.shape[1]] = arc.visit_counts
+        arc.visit_counts = vc
+    b_clamped = blk.clamp(min=0, max=cap_blk - 1)
+    ones = torch.ones_like(b_clamped, dtype=torch.int16)
+    arc.visit_counts.scatter_add_(1, b_clamped, ones)
+
+
 def retrieve_blocks_per_token(arc: Archive, q: torch.Tensor, groups: int, limit: int, budget: int = 0,
                               lead: int | None = None, union: int = 0,
                               q_hist: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor | None] | None:
-    """Per-query Z-score + tiered + 2-hop retrieval with [b, b+1] successor expansion and prompt-question retention."""
+    """Per-query Z-score + tiered + 2-hop retrieval with [b, b+1] successor expansion, prompt-question retention,
+    and Dense Global Aggregation support (stratified timeline coverage + novelty-rotating decode sweep)."""
     block = MEMORY["block_size"]
     full = (limit - ORIGIN) // block
     if full <= 0:
         return None
+    eff_stride = GLOBAL_DECODE_STRIDE if arc.is_global_agg else DECODE_STRIDE
     if lead == 0 and q.shape[0] <= MEMORY["chunk"]:
         arc.decode_step += 1
-        if (DECODE_STRIDE > 1 and arc.cached_top is not None
-                and arc.decode_step % DECODE_STRIDE != 0):
+        if (eff_stride > 1 and arc.cached_top is not None
+                and arc.decode_step % eff_stride != 0):
             return arc.cached_top, None
     elif lead is not None and lead < 0:
         arc.decode_step = 0
@@ -880,6 +1027,8 @@ def retrieve_blocks_per_token(arc: Archive, q: torch.Tensor, groups: int, limit:
         arc.cached_top = arc.cached_rk = arc.cached_rv = None
         arc.cached_pre_k = arc.cached_pre_v = None
         arc.cached_ns = -1
+        if arc.visit_counts is not None:
+            arc.visit_counts.zero_()
     arc.refresh_bounds(block)
     q_step = q[:1] if (lead == 0 and q.shape[0] > 1) else q
     q_eval = (torch.cat((q_hist[:-1], q_step), dim=0)
@@ -905,7 +1054,7 @@ def retrieve_blocks_per_token(arc: Archive, q: torch.Tensor, groups: int, limit:
     if lead == 0 and not DECODE_RERANK:
         k_dec = min(DECODE_BLOCKS if DECODE_BLOCKS > 0 else (MEMORY["decode_blocks"] or MEMORY["blocks"]), n_valid)
         fine_idx = None
-        if SBLK > 1 and arc.smax is not None and arc.smin is not None and full > SBLK * 16:
+        if SBLK > 1 and arc.smax is not None and arc.smin is not None and full > SBLK * 16 and not arc.is_global_agg:
             n_sb = (full + SBLK - 1) // SBLK
             smax_t = arc.smax[:, :n_sb].to(s_dtype).transpose(-1, -2)
             smin_t = arc.smin[:, :n_sb].to(s_dtype).transpose(-1, -2)
@@ -937,6 +1086,10 @@ def retrieve_blocks_per_token(arc: Archive, q: torch.Tensor, groups: int, limit:
         s_rel_fin = s_rel.masked_fill(score.isinf(), 0.0)
         z_rel = (s_rel - s_rel_fin.mean(-1, keepdim=True)) / s_rel_fin.std(-1, keepdim=True).clamp(min=1e-6)
         z_raw = (score - s_fin.mean(-1, keepdim=True)) / s_fin.std(-1, keepdim=True).clamp(min=1e-6)
+        if arc.is_global_agg and arc.visit_counts is not None and fine_idx is None:
+            vc_pen = NOVELTY_ALPHA * torch.log1p(arc.visit_counts[:, :full].float()).unsqueeze(1)
+            z_raw = z_raw - vc_pen
+            z_rel = z_rel - vc_pen
         ranks = _ranks(score)
         r_tier = ranks.amin(1) * n_pool + _ranks(score.amax(1))
         if t_ev > 8:
@@ -956,7 +1109,11 @@ def retrieve_blocks_per_token(arc: Archive, q: torch.Tensor, groups: int, limit:
                                       (-r_tier).topk(k_sel, dim=-1).indices), dim=-1).view(kv, 3 * k_sel)
         keep_ord = _dedup_priority(keep_inter, k_sel)
         blk_ord = fine_idx.gather(-1, keep_ord) if fine_idx is not None else keep_ord
-        if arc.decode_top is not None:
+        if arc.is_global_agg and fine_idx is None and full >= SBLK * 2:
+            strat = _stratified_superblock_peaks(z_raw.amax(1), full, max(8, k_sel // 2))
+            n_top = max(1, k_sel // 2)
+            blk_ord = _dedup_priority(torch.cat((blk_ord[:, :n_top], strat, blk_ord[:, n_top:]), dim=-1), k_sel)
+        if arc.decode_top is not None and not arc.is_global_agg:
             d_prev = arc.decode_top.clamp(max=full - 1)
             k_d = min(d_prev.shape[1], blk_ord.shape[1])
             d_inter = torch.stack((blk_ord[:, :k_d], d_prev[:, :k_d]), dim=-1).view(kv, 2 * k_d)
@@ -969,13 +1126,15 @@ def retrieve_blocks_per_token(arc: Archive, q: torch.Tensor, groups: int, limit:
         if arc.prompt_top is not None:
             p_prev = arc.prompt_top.clamp(max=full - 1)
             k_out = min(p_prev.shape[1], n_valid)
-            n_pin = max(0, k_out - dec_prio.shape[1])
+            n_pin = (k_out // 2) if arc.is_global_agg else max(0, k_out - dec_prio.shape[1])
             merged = torch.cat((p_prev[:, :n_pin], dec_prio, p_prev[:, n_pin:]), dim=-1)
             top_prio = _dedup_priority(merged, k_out)
             blk, arc.last_prio_rank = top_prio.sort(-1)
         else:
             _, arc.last_prio_rank = dec_prio.sort(-1)
             blk = dec_sorted
+        if arc.is_global_agg:
+            _record_block_visits(arc, dec_prio, full)
         STATS["retrievals"] += 1
         STATS["pertoken"] += 1
         return blk, None
@@ -1008,6 +1167,14 @@ def retrieve_blocks_per_token(arc: Archive, q: torch.Tensor, groups: int, limit:
     s_rel_fin = s_rel.masked_fill(score.isinf(), 0.0)
     z_score_rel = (s_rel - s_rel_fin.mean(-1, keepdim=True)) / s_rel_fin.std(-1, keepdim=True).clamp(min=1e-6)
     z_score_raw = (score - s_fin.mean(-1, keepdim=True)) / s_fin.std(-1, keepdim=True).clamp(min=1e-6)
+    if lead is not None and lead < 0:
+        arc.is_global_agg = _detect_global_agg(z_score_raw, full)
+        if arc.is_global_agg:
+            STATS["global_agg"] = STATS.get("global_agg", 0) + 1
+    elif lead == 0 and arc.is_global_agg and arc.visit_counts is not None:
+        vc_pen = NOVELTY_ALPHA * torch.log1p(arc.visit_counts[:, :full].float()).unsqueeze(1)
+        z_score_raw = z_score_raw - vc_pen
+        z_score_rel = z_score_rel - vc_pen
     ranks = _ranks(score)                                                              # [KV, T_eval, full]
     r_tier = ranks.amin(1) * full + _ranks(score.amax(1))                              # [KV, full]
     if lead is not None and lead < 0 and t_ev > 36:
@@ -1082,6 +1249,10 @@ def retrieve_blocks_per_token(arc: Archive, q: torch.Tensor, groups: int, limit:
                                   (-e_tier).topk(k, dim=-1).indices), dim=-1).view(kv, 3 * k)
     keep_ord = _dedup_priority(keep_inter, k)                                          # [KV, k]
     blk_ord = cand.gather(-1, keep_ord)                                                # [KV, k]
+    if arc.is_global_agg and full >= SBLK * 2:
+        strat = _stratified_superblock_peaks(z_score_raw.amax(1), full, max(16, k // 4))
+        n_keep_top = max(1, (3 * k) // 4)
+        blk_ord = _dedup_priority(torch.cat((blk_ord[:, :n_keep_top], strat, blk_ord[:, n_keep_top:]), dim=-1), k)
     if MEMORY["rerank"] and n_valid > 16:
         n_seed = min(8, blk_ord.shape[1])
         cur_head = blk_ord[:, :n_seed]
@@ -1097,7 +1268,7 @@ def retrieve_blocks_per_token(arc: Archive, q: torch.Tensor, groups: int, limit:
         arc.decode_top = None
         merged_ord = blk_ord
     elif arc.prompt_top is not None:
-        if arc.decode_top is not None:
+        if arc.decode_top is not None and not arc.is_global_agg:
             d_prev = arc.decode_top.clamp(max=full - 1)
             k_d = min(d_prev.shape[1], blk_ord.shape[1])
             d_inter = torch.stack((blk_ord[:, :k_d], d_prev[:, :k_d]), dim=-1).view(kv, 2 * k_d)
@@ -1116,6 +1287,8 @@ def retrieve_blocks_per_token(arc: Archive, q: torch.Tensor, groups: int, limit:
     blk, arc.last_prio_rank = top_prio.sort(-1)
     if lead is not None and lead < 0:
         arc.prompt_top = top_prio
+    if arc.is_global_agg:
+        _record_block_visits(arc, top_prio, full)
     STATS["retrievals"] += 1
     STATS["pertoken"] += 1
     return blk, None
@@ -1139,8 +1312,8 @@ def piece_attention(arc: Archive, q: torch.Tensor, q_pos: torch.Tensor, top: tor
                     window: int, scale: float, own: torch.Tensor | None = None,
                     q_min: int | None = None, q_max: int | None = None) -> torch.Tensor:
     """Exact attention of piece q [T, H, D] at positions q_pos over its sliding window (from the archive) plus the
-    retrieved blocks `top` [KV, k]; with `own` [KV, T, k] each query sees only its own retrieved blocks.
-    Returns [T, H, D]."""
+    retrieved blocks `top` [KV, k] (and super-block summary landmarks when `arc.is_global_agg` is active);
+    with `own` [KV, T, k] each query sees only its own retrieved blocks. Returns [T, H, D]."""
     block = MEMORY["block_size"]
     t, h, d = q.shape
     kv = h // groups
@@ -1156,6 +1329,7 @@ def piece_attention(arc: Archive, q: torch.Tensor, q_pos: torch.Tensor, top: tor
     fold_tail = bool(use_lse and t <= MEMORY["chunk"] and FAITHFUL and top is not None and lo > tail0)
     w_lo = tail0 if fold_tail else lo
     ns = min(SINKS, lo)                                                                # sink positions below the window
+    n_sb_valid = max(0, ((lo - ORIGIN) // block) // SBLK) if (arc.is_global_agg and arc.smean_k is not None and arc.smean_v is not None) else 0
     if use_lse:
         if arc.gpu_k is not None and w_lo >= arc.gpu_lo and hi <= arc.gpu_hi:
             wk_t = arc.gpu_k[w_lo - arc.gpu_lo : hi - arc.gpu_lo].to(dtype=q.dtype)    # [Wn, KV, D] zero-copy slice
@@ -1177,6 +1351,7 @@ def piece_attention(arc: Archive, q: torch.Tensor, q_pos: torch.Tensor, top: tor
                 arc.cached_rv = rv
                 ref_pos = lo
                 rk = _reposition_rope_blocks(rk_raw, top, block, ref_pos, contiguous_runs=True, prio_rank=arc.last_prio_rank)
+                pre_k_list, pre_v_list = [], []
                 if ns > 0:
                     if arc.sink_k is not None and ns <= arc.sink_k.shape[0]:
                         sk_kv = arc.sink_k[:ns].transpose(0, 1).to(dtype=q.dtype)
@@ -1184,12 +1359,18 @@ def piece_attention(arc: Archive, q: torch.Tensor, q_pos: torch.Tensor, top: tor
                     else:
                         sk_kv = arc.keys[:, :ns].to(device=q.device, dtype=q.dtype)
                         sv_t = arc.values[:, :ns].to(device=q.device, dtype=q.dtype).transpose(0, 1)
-                    sk_t = _reposition_rope_sinks(sk_kv, ref_pos).transpose(0, 1)
-                    pre_k = torch.cat((sk_t, rk.transpose(0, 1)), dim=0)
-                    pre_v = torch.cat((sv_t, rv.transpose(0, 1)), dim=0)
-                else:
-                    pre_k = rk.transpose(0, 1).contiguous()
-                    pre_v = rv.transpose(0, 1).contiguous()
+                    sk_t = _reposition_rope_sinks(sk_kv, ref_pos, n_blk=top.shape[1], block=block).transpose(0, 1)
+                    pre_k_list.append(sk_t)
+                    pre_v_list.append(sv_t)
+                if n_sb_valid > 0:
+                    smk = _reposition_rope_landmarks(arc.smean_k[:, :n_sb_valid].to(dtype=q.dtype), block, ref_pos).transpose(0, 1)
+                    smv = arc.smean_v[:, :n_sb_valid].to(dtype=q.dtype).transpose(0, 1)
+                    pre_k_list.append(smk)
+                    pre_v_list.append(smv)
+                pre_k_list.append(rk.transpose(0, 1))
+                pre_v_list.append(rv.transpose(0, 1))
+                pre_k = pre_k_list[0].contiguous() if len(pre_k_list) == 1 else torch.cat(pre_k_list, dim=0).contiguous()
+                pre_v = pre_v_list[0].contiguous() if len(pre_v_list) == 1 else torch.cat(pre_v_list, dim=0).contiguous()
                 arc.cached_ns = ns
                 arc.cached_pre_k = pre_k
                 arc.cached_pre_v = pre_v
@@ -1208,7 +1389,7 @@ def piece_attention(arc: Archive, q: torch.Tensor, q_pos: torch.Tensor, top: tor
             return torch.lerp(out_w.float(), out_p.float(), w).to(q.dtype)
     elif arc.gpu_k is not None and lo >= arc.gpu_lo and hi <= arc.gpu_hi:
         wk = arc.gpu_k[lo - arc.gpu_lo : hi - arc.gpu_lo].transpose(0, 1).to(dtype=q.dtype)
-        wv = arc.gpu_v[lo - arc.gpu_lo : hi - arc.gpu_lo].transpose(0, 1).to(dtype=q.dtype)
+        wv = arc.gpu_v[lo - arc.gpu_lo : hi - arc.gpu_lo].transpose(0, 1).transpose(0, 1) if False else arc.gpu_v[lo - arc.gpu_lo : hi - arc.gpu_lo].transpose(0, 1).to(dtype=q.dtype)
     else:
         wk = arc.keys[:, lo:hi].to(device=q.device).to(dtype=q.dtype)                  # [KV, Wn, D]
         wv = arc.values[:, lo:hi].to(device=q.device).to(dtype=q.dtype)
@@ -1216,6 +1397,7 @@ def piece_attention(arc: Archive, q: torch.Tensor, q_pos: torch.Tensor, top: tor
     need_mask = not (use_lse or unmasked)
     parts_k, parts_v, parts_allow = [], [], []
     ref_pos = lo
+    n_blk_cur = top.shape[1] if top is not None else 0
     if ns > 0:
         if arc.sink_k is not None and ns <= arc.sink_k.shape[0]:
             sk_kv = arc.sink_k[:ns].transpose(0, 1).to(dtype=q.dtype)
@@ -1223,9 +1405,16 @@ def piece_attention(arc: Archive, q: torch.Tensor, q_pos: torch.Tensor, top: tor
         else:
             sk_kv = arc.keys[:, :ns].to(device=q.device).to(dtype=q.dtype)
             parts_v.append(arc.values[:, :ns].to(device=q.device).to(dtype=q.dtype))
-        parts_k.append(_reposition_rope_sinks(sk_kv, ref_pos))
+        parts_k.append(_reposition_rope_sinks(sk_kv, ref_pos, n_blk=n_blk_cur, block=block))
         if need_mask:
             parts_allow.append(torch.ones(t, ns, dtype=torch.bool, device=q.device))
+    if n_sb_valid > 0:
+        smk = _reposition_rope_landmarks(arc.smean_k[:, :n_sb_valid].to(dtype=q.dtype), block, ref_pos)
+        smv = arc.smean_v[:, :n_sb_valid].to(dtype=q.dtype)
+        parts_k.append(smk)
+        parts_v.append(smv)
+        if need_mask:
+            parts_allow.append(torch.ones(t, n_sb_valid, dtype=torch.bool, device=q.device))
     if top is not None:
         if arc.last_top is top and arc.last_rk is not None:
             rk_raw = arc.last_rk.to(dtype=q.dtype)
@@ -1301,52 +1490,118 @@ def piece_attention(arc: Archive, q: torch.Tensor, q_pos: torch.Tensor, top: tor
     return out[0].reshape(h, t, d).transpose(0, 1).to(q.dtype)
 
 
+@dataclass
+class _SyntheticInputBatch:
+    """Zero-hook fallback batch descriptor synthesized directly from ForwardContext / positions when
+    upstream vLLM runner internals change."""
+    num_tokens: int
+    req_ids: list[str]
+    query_start_loc_np: list[int]
+
+
+def _fallback_batch_from_forward_context(positions: torch.Tensor, q: torch.Tensor) -> _SyntheticInputBatch | None:
+    """Synthesize an InputBatch-compatible object from vLLM ForwardContext or position resets when runner hooks
+    are unavailable."""
+    pos = positions[0] if positions.dim() == 2 else positions
+    t = int(min(pos.numel(), q.shape[0]))
+    if t <= 0:
+        return None
+    try:
+        from vllm.forward_context import get_forward_context
+        ctx = get_forward_context()
+        attn_meta = getattr(ctx, "attn_metadata", None)
+        if isinstance(attn_meta, dict) and attn_meta:
+            attn_meta = next(iter(attn_meta.values()))
+        qsl = getattr(attn_meta, "query_start_loc", None)
+        if qsl is not None and isinstance(qsl, torch.Tensor) and qsl.numel() >= 2:
+            qsl_list = [int(x) for x in qsl.detach().cpu().tolist() if int(x) <= t]
+            if len(qsl_list) >= 2 and qsl_list[-1] > 0:
+                n_req = len(qsl_list) - 1
+                return _SyntheticInputBatch(
+                    num_tokens=qsl_list[-1],
+                    req_ids=[f"pb27_ctx_{i}" for i in range(n_req)],
+                    query_start_loc_np=qsl_list,
+                )
+    except Exception:
+        pass
+    return _SyntheticInputBatch(num_tokens=t, req_ids=["pb27_default_req"], query_start_loc_np=[0, t])
+
+
 def install_runner_hooks() -> None:
-    """Expose the runner's current InputBatch and free archives of finished requests (V2 GPU runner)."""
-    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
-    from vllm.v1.worker.gpu.states import RequestState
+    """Expose the runner's current InputBatch and free archives of finished requests across both vLLM V1
+    (`vllm.v1.worker.gpu_model_runner`) and modular V1/V2 (`vllm.v1.worker.gpu.model_runner`) layouts."""
+    try:
+        from vllm.v1.worker.gpu.model_runner import GPUModelRunner
+        from vllm.v1.worker.gpu.states import RequestState
 
-    if getattr(GPUModelRunner, "_pb27_hooked", False):
+        if getattr(GPUModelRunner, "_pb27_hooked", False):
+            return
+        orig_prepare = GPUModelRunner.prepare_inputs
+        orig_add = RequestState.add_request
+        orig_remove = RequestState.remove_request
+
+        def prepare_inputs(self, *args, **kwargs):
+            ib = orig_prepare(self, *args, **kwargs)
+            BATCH["ib"] = ib
+            BATCH["pos_list"] = None
+            BATCH["req_bounds"] = None
+            return ib
+
+        def add_request(self, req_id, prompt_len, *args, **kwargs):
+            PROMPT_LENS[req_id] = int(prompt_len)
+            all_token_ids = kwargs.get("all_token_ids", args[0] if len(args) > 0 else None)
+            num_computed = kwargs.get("num_computed_tokens", args[1] if len(args) > 1 else 0)
+            if all_token_ids is not None and num_computed:
+                adopt_for_request(req_id, all_token_ids, int(num_computed))
+            if int(prompt_len) > 262144 and not ADOPTED.get(req_id, ({},))[0] and len(RETIRED) >= max(1, RETAIN):
+                while RETIRED:
+                    _free(RETIRED.pop(0)["archives"])
+            return orig_add(self, req_id, prompt_len, *args, **kwargs)
+
+        def remove_request(self, req_id, *args, **kwargs):
+            tokens = None
+            if RETAIN > 0 and req_id in self.req_id_to_index:
+                idx = self.req_id_to_index[req_id]
+                try:
+                    n = int(self.total_len.gpu[idx])
+                    tokens = self.all_token_ids.gpu[idx, :n].clone()
+                except Exception as exc:
+                    log.warning("pb27 memory: cannot read token ids for %s (%s); not retaining", req_id, exc)
+            drop_request(req_id, tokens)
+            return orig_remove(self, req_id, *args, **kwargs)
+
+        GPUModelRunner.prepare_inputs = prepare_inputs
+        RequestState.add_request = add_request
+        RequestState.remove_request = remove_request
+        GPUModelRunner._pb27_hooked = True
+        log.info("pb27 memory tier: runner hooks installed (V2 layout, pid %d), config %s", os.getpid(), MEMORY)
         return
-    orig_prepare = GPUModelRunner.prepare_inputs
-    orig_add = RequestState.add_request
-    orig_remove = RequestState.remove_request
+    except ImportError:
+        pass
 
-    def prepare_inputs(self, *args, **kwargs):
-        ib = orig_prepare(self, *args, **kwargs)
-        BATCH["ib"] = ib
-        BATCH["pos_list"] = None
-        BATCH["req_bounds"] = None
-        return ib
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner as V1GPUModelRunner
 
-    def add_request(self, req_id, prompt_len, *args, **kwargs):
-        PROMPT_LENS[req_id] = int(prompt_len)
-        all_token_ids = kwargs.get("all_token_ids", args[0] if len(args) > 0 else None)
-        num_computed = kwargs.get("num_computed_tokens", args[1] if len(args) > 1 else 0)
-        if all_token_ids is not None and num_computed:
-            adopt_for_request(req_id, all_token_ids, int(num_computed))
-        if int(prompt_len) > 262144 and not ADOPTED.get(req_id, ({},))[0] and len(RETIRED) >= max(1, RETAIN):
-            while RETIRED:
-                _free(RETIRED.pop(0)["archives"])
-        return orig_add(self, req_id, prompt_len, *args, **kwargs)
+    if getattr(V1GPUModelRunner, "_pb27_hooked", False):
+        return
+    orig_update = getattr(V1GPUModelRunner, "_update_states", None)
+    if orig_update is not None:
+        def _update_states(self, scheduler_output, *args, **kwargs):
+            for req_id in getattr(scheduler_output, "finished_req_ids", ()):
+                drop_request(req_id, None)
+            for new_req in getattr(scheduler_output, "scheduled_new_reqs", ()):
+                r_id = getattr(new_req, "req_id", None)
+                p_ids = getattr(new_req, "prompt_token_ids", None)
+                if r_id is not None and p_ids is not None:
+                    PROMPT_LENS[r_id] = len(p_ids)
+            res = orig_update(self, scheduler_output, *args, **kwargs)
+            BATCH["ib"] = getattr(self, "input_batch", None)
+            BATCH["pos_list"] = None
+            BATCH["req_bounds"] = None
+            return res
 
-    def remove_request(self, req_id, *args, **kwargs):
-        tokens = None
-        if RETAIN > 0 and req_id in self.req_id_to_index:
-            idx = self.req_id_to_index[req_id]
-            try:   # prompt + accepted output tokens, maintained on the GPU by the runner's post-update step
-                n = int(self.total_len.gpu[idx])
-                tokens = self.all_token_ids.gpu[idx, :n].clone()
-            except Exception as exc:   # internals differ: fall back to no retention
-                log.warning("pb27 memory: cannot read token ids for %s (%s); not retaining", req_id, exc)
-        drop_request(req_id, tokens)
-        return orig_remove(self, req_id, *args, **kwargs)
-
-    GPUModelRunner.prepare_inputs = prepare_inputs
-    RequestState.add_request = add_request
-    RequestState.remove_request = remove_request
-    GPUModelRunner._pb27_hooked = True
-    log.info("pb27 memory tier: runner hooks installed (pid %d), config %s", os.getpid(), MEMORY)
+        V1GPUModelRunner._update_states = _update_states
+        V1GPUModelRunner._pb27_hooked = True
+        log.info("pb27 memory tier: runner hooks installed (V1 layout, pid %d), config %s", os.getpid(), MEMORY)
 
 
 def _layer_enabled(layer_name: str) -> bool:
@@ -1391,9 +1646,11 @@ def windowed_attention_with_memory(attn_module, q: torch.Tensor, k: torch.Tensor
     STATS["calls"] += 1
     if DEBUG and STATS["calls"] % 500 == 1:
         log.info("pb27 memory: call %d ib=%s archives=%d stats=%s", STATS["calls"], ib is not None, len(ARCHIVES), STATS)
-    if ib is None or not ib.req_ids:
-        STATS["fallback"] += 1
-        return attn_module(q, k, v)
+    if ib is None or not getattr(ib, "req_ids", None):
+        ib = _fallback_batch_from_forward_context(positions, q)
+        if ib is None or not ib.req_ids:
+            STATS["fallback"] += 1
+            return attn_module(q, k, v)
     layer = attn_module.layer_name
     if not _layer_enabled(layer):
         return attn_module(q, k, v)
@@ -1538,15 +1795,16 @@ def windowed_attention_with_memory(attn_module, q: torch.Tensor, k: torch.Tensor
                 budget = 0
             rr = (p1 - p0) <= q_piece if PREFILL == "pt" else rerank
             q_hist = None
+            eff_stride = GLOBAL_DECODE_STRIDE if arc.is_global_agg else DECODE_STRIDE
             need_q_hist = (
                 (QWIN or PERTOKEN)
                 and not is_prefill
                 and arc.qbuf is not None
                 and (
                     QWIN
-                    or DECODE_STRIDE <= 1
+                    or eff_stride <= 1
                     or arc.cached_top is None
-                    or (arc.decode_step + 1) % DECODE_STRIDE == 0
+                    or (arc.decode_step + 1) % eff_stride == 0
                 )
             )
             if need_q_hist:
