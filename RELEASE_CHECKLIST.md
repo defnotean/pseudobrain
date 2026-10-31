@@ -11,7 +11,7 @@
 - [x] `pyproject.toml` with pinned deps and CPU smoke test (`make smoke`).
 
 ## Weights
-- [x] Upload `PseudoBrain-Nex-35B-A3B-NVFP4` (`defnotean1/PseudoBrain-Nex-35B-A3B-NVFP4`) and `PseudoBrain-27B-NVFP4` (`defnotean1/PseudoBrain-27B-NVFP4`) + slim GDN shards (`defnotean1/pb27-checkpoints`) to Hugging Face under `defnotean1`.
+- [x] Upload `PseudoBrain-Nex-35B-A3B-NVFP4` (`defnoteatin/PseudoBrain-Nex-35B-A3B-NVFP4`) and `PseudoBrain-27B-NVFP4` (`defnoteatin/PseudoBrain-27B-NVFP4`) + slim GDN shards (`defnoteatin/pb27-checkpoints`) to Hugging Face under `defnoteatin`.
 - [x] Include `make_pb27_nvfp4.py` script that builds NVFP4 + BF16 GDN compositions from public NVFP4 checkpoints.
 - [x] Model cards in `checkpoints/PseudoBrain-Nex-35B-A3B-NVFP4/README.md` and `checkpoints/PseudoBrain-27B-NVFP4/README.md`.
 

@@ -1151,7 +1151,7 @@ def piece_attention(arc: Archive, q: torch.Tensor, q_pos: torch.Tensor, top: tor
         contig_q = (t == 1 or (q_max - q_min == t - 1))
     lo = max(0, q_min - window + 1)
     hi = q_max + 1
-    use_lse = (own is None and LSE and HAS_FA2 and q.is_cuda and q.dtype in (torch.bfloat16, torch.float16) and contig_q)
+    use_lse = (own is None and LSE and HAS_FA2 and d <= 256 and q.is_cuda and q.dtype in (torch.bfloat16, torch.float16) and contig_q)
     tail0 = ORIGIN + ((lo - ORIGIN) // block) * block
     fold_tail = bool(use_lse and t <= MEMORY["chunk"] and FAITHFUL and top is not None and lo > tail0)
     w_lo = tail0 if fold_tail else lo

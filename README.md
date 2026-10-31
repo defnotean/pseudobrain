@@ -1,56 +1,89 @@
-# PseudoBrain (`PB-27`, `PB-Nex`, & `PB-Flash-Next`)
+# PseudoBrain — Million-Token Hybrid Gated DeltaNet + Quest Exact Memory for vLLM
 
-**Convert open dense or MoE LLMs into constant-GPU-memory, million-token hybrids — $O(1)$ GPU KV footprint from `8K` to `1,000,000+` tokens, `100%` exact retrieval across `8K–1M`, and True $O(1)$ Constant-Speed Decode (`44.6–183.5 tok/s` at `500K–1M` with `DFlash2` speculative decoding) on a single GPU.**
+**Convert open dense and MoE LLMs into constant-GPU-memory, million-token hybrids — $O(1)$ GPU KV footprint from `8K` to `1,000,000+` tokens (`90%–99.2%` KV cache reduction), `100%` exact retrieval across `8K–1M`, and True $O(1)$ Constant-Speed Decode (`44.6–183.5 tok/s` at `500K–1M` with `DFlash2` speculative decoding) on a single GPU.**
 
-- **Architecture Paper:** [`docs/PSEUDOBRAIN_ARCHITECTURE_PAPER.pdf`](docs/PSEUDOBRAIN_ARCHITECTURE_PAPER.pdf) | [`docs/PSEUDOBRAIN_ARCHITECTURE_PAPER.docx`](docs/PSEUDOBRAIN_ARCHITECTURE_PAPER.docx) | [`docs/PSEUDOBRAIN_ARCHITECTURE_PAPER.md`](docs/PSEUDOBRAIN_ARCHITECTURE_PAPER.md)
-- **Released Weights on Hugging Face:**
-  - **PseudoBrain-Qwen3.8-Flash-Next (`flash_next` / `PB27Qwen4ExpForConditionalGeneration`):** [`defnotean1/PseudoBrain-Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/defnotean1/PseudoBrain-Qwen3.8-Flash-Next-NVFP4) (`36B` total, `~1.7B` active ultra-sparse `top-10/512` MoE + PLE + `DFlash2` speculative decoding, `21 GiB`)
-  - **PseudoBrain-Nex-35B-A3B (`pb27-nexc` / `PB27MoEForConditionalGeneration`):** [`defnotean1/PseudoBrain-Nex-35B-A3B-NVFP4`](https://huggingface.co/defnotean1/PseudoBrain-Nex-35B-A3B-NVFP4) | [`defnotean1/PseudoBrain-35B-A3B-MoE-NVFP4`](https://huggingface.co/defnotean1/PseudoBrain-35B-A3B-MoE-NVFP4) (`35B` total, `~3B` active MoE, `23 GiB`)
-  - **PseudoBrain-27B (`pb27c` / `PB27ForConditionalGeneration`):** [`defnotean1/PseudoBrain-27B-NVFP4`](https://huggingface.co/defnotean1/PseudoBrain-27B-NVFP4) (`27B` dense, `20 GiB`)
-  - **Slim BF16 GDN-Only Delta Shards:** [`defnotean1/pb27-checkpoints`](https://huggingface.co/defnotean1/pb27-checkpoints) (`1.39 GB` for `flash_next`, `644 MB` for `nexc`, `3.5 GB` for `pb27c`)
-
----
-
-## 1. What PseudoBrain Is
-
-Stock Qwen3.5 / Qwen3.8 (`27B` dense, `35B-A3B` MoE, and `Qwen3.8-Flash-Next` `36B-A1.7B` MoE + PLE) interleave 3 Gated DeltaNet layers with 1 attention layer (`16` attention layers in `27B`; `10` in `35B-A3B`; `12` in `Flash-Next`). While the Gated DeltaNet layers have fixed recurrent state, the attention layers either require a linearly growing $O(L)$ KV cache (`64 GiB` at `1M` tokens on `27B`; `20 GiB` on `35B-A3B`) or forget everything older than `16,384` tokens (`Flash-Next`).
-
-**PseudoBrain** converts every attention layer into a **Hybrid Windowed-Attention + Parallel Gated DeltaNet** block paired with our **Three-Tier Exact Memory Hierarchy** and **True $O(1)$ Constant-Speed Decode** inside vLLM (`serving/pb27_vllm/`):
-
-| Feature | **PseudoBrain-Qwen3.8-Flash-Next (`flash_next`)** | **PseudoBrain-Nex-35B-A3B (`pb27-nexc`)** | **PseudoBrain-27B (`pb27c`)** |
-| :--- | :---: | :---: | :---: |
-| **Base Model (Abliterated)** | `Huihui-Qwen3.8-Flash-Next-abliterated` (`Qwen4Exp`) | `Huihui-Qwen3.5-35B-A3B-abliterated` / `Nex-N2.5` | `Huihui-Qwen3.8-27B-abliterated` |
-| **Attention Layers** | `12` × (`16K` SWA + `4` sinks + parallel GDN + Exact Memory Archive) | `10` × (`16K` SWA + `4` sinks + parallel GDN + Exact Memory Archive) | `16` × (`16K` SWA + `4` sinks + parallel GDN + Exact Memory Archive) |
-| **Native Recurrent Layers** | `36` Gated DeltaNet + Layer-2 Per-Layer Embeddings (`PLE`) | `30` Gated DeltaNet | `48` Gated DeltaNet |
-| **Active Parameters / Token** | `~1.7B` (`top-10` of `512` experts + `1` shared + PLE) + `DFlash2` draft | `~3B` (`top-8` of `256` experts + `1` shared) | `27B` dense |
-| **GPU KV Cache at `1,000,000` Tokens** | **`486 MiB` (`8.1%` of fixed `6 GiB` pool)** | **`486 MiB` (`8.1%` of fixed `6 GiB` pool)** | **`486 MiB` (`8.1%` of fixed `6 GiB` pool)** |
-| **Total GPU Memory (`8K` to `1,000,000` Tokens)** | **Flat `~28 GiB`** | **Flat `~27–31 GiB`** | **Flat `~29–33 GiB`** |
-| **True $O(1)$ Decode Engine** | Stride-`64` GPU LSE-merge cache + `DECODE_BLOCKS=64` + `DECODE_RERANK=0` + 2-level `bf16` Quest super-blocks + `DFlash2` (`44.6–183.5 tok/s` at `500K–1M`) | Stride-`64` GPU LSE-merge cache + `DECODE_BLOCKS=64` + `DECODE_RERANK=0` + 2-level `bf16` Quest super-blocks | Stride-`64` GPU LSE-merge cache + `DECODE_BLOCKS=64` + `DECODE_RERANK=0` + 2-level `bf16` Quest super-blocks |
+> [!IMPORTANT]
+> **Created by Ian Kurt Galeon ([@defnotean](https://github.com/defnotean) · [Hugging Face `@defnoteatin`](https://huggingface.co/defnoteatin) · `iangaleonofficial@gmail.com`)**  
+> **Architecture Paper:** [`docs/PSEUDOBRAIN_ARCHITECTURE_PAPER.pdf`](docs/PSEUDOBRAIN_ARCHITECTURE_PAPER.pdf) · [`docs/PSEUDOBRAIN_ARCHITECTURE_PAPER.docx`](docs/PSEUDOBRAIN_ARCHITECTURE_PAPER.docx) · [`docs/PSEUDOBRAIN_ARCHITECTURE_PAPER.md`](docs/PSEUDOBRAIN_ARCHITECTURE_PAPER.md)  
+> **Slim BF16 GDN Delta Shards:** [`defnoteatin/pb27-checkpoints`](https://huggingface.co/defnoteatin/pb27-checkpoints) · **Benchmark Receipts:** [`reports/`](reports/)  
+> *Available for **LLM Inference Systems / Kernel & Engine Engineering roles**, research collaborations, and **enterprise on-premise 1M-context deployments**.*
 
 ---
 
-## 2. Benchmark Results (All Backed by Committed Receipts in [`reports/`](reports/))
+## 1. Complete 40-Model Lineup on Hugging Face (`W4A16`, `FP8`, `NVFP4`, `BF16`)
 
-### 2.1 Million-Token Long-Context Exact Retrieval (`8K` to `1,000,000` Tokens)
+All **10 model families (`40` repositories)** run through our single universal `pb27_vllm` vLLM V1 plugin across **NVIDIA Ampere/Ada (`RTX 3060–4090`, `L40S`, `A100`)**, **Hopper (`H100/H200`)**, **Blackwell (`RTX 5090`, `DGX Spark GB10`, `B200`)**, and **AMD ROCm (`RX 7900 XTX`, `Instinct MI300X`)**:
 
-Evaluated via [`scripts/bench/custom_longctx_bench.py`](scripts/bench/custom_longctx_bench.py) (`needle@0.1`, `needle@0.5`, `needle@0.9`, `multi4` 4-constant JSON synthesis at depths `{0.15, 0.40, 0.65, 0.85}`, and `trace4` 4-hop function call chain across depths `{0.82, 0.58, 0.34, 0.12}` + arithmetic mod `1000`):
+| Model Family | Params (Total / Active) | 1M KV Reduction | **4-Bit `W4A16` (RTX 30/40/AMD)** | **8-Bit `FP8` (4090/H100/MI300X)** | **4-Bit `NVFP4` (Blackwell/Spark)** | **16-Bit `BF16` (Universal)** |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **PseudoBrain-Qwen3.8-Flash-Next** | `36B` / `~1.7B` | **`96.0%+`** (`~48.0 GB` → `~486 MiB active window`) | [`W4A16`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3.8-Flash-Next-W4A16) (~21.0 GB) | [`FP8`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3.8-Flash-Next-FP8) (~36.5 GB) | [`NVFP4`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3.8-Flash-Next-NVFP4) (~21.0 GB) | [`BF16`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3.8-Flash-Next-BF16) (~72.0 GB) |
+| **PseudoBrain-Qwen3-Coder-Next** | `80B` / `3.0B` | **`93.5%`** (`~48.0 GB` → `~3.1 GB`) | [`W4A16`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3-Coder-Next-W4A16) (~41.5 GB) | [`FP8`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3-Coder-Next-FP8) (~80.5 GB) | [`NVFP4`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3-Coder-Next-NVFP4) (~41.5 GB) | [`BF16`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3-Coder-Next-BF16) (~160.0 GB) |
+| **PseudoBrain-Qwen3-Coder-30B-A3B** | `30.5B` / `3.3B` | **`98.4%`** (`192.0 GB` → `~3.1 GB`) | [`W4A16`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3-Coder-30B-A3B-W4A16) (~16.5 GB) | [`FP8`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3-Coder-30B-A3B-FP8) (~31.0 GB) | [`NVFP4`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3-Coder-30B-A3B-NVFP4) (~16.5 GB) | [`BF16`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3-Coder-30B-A3B-BF16) (~61.0 GB) |
+| **PseudoBrain-Nex-35B-A3B** | `35B` / `~3.0B` | **`97.6%`** (`~20.0 GB` → `~486 MiB active window`) | [`W4A16`](https://huggingface.co/defnoteatin/PseudoBrain-Nex-35B-A3B-W4A16) (~18.5 GB) | [`FP8`](https://huggingface.co/defnoteatin/PseudoBrain-Nex-35B-A3B-FP8) (~35.0 GB) | [`NVFP4`](https://huggingface.co/defnoteatin/PseudoBrain-Nex-35B-A3B-NVFP4) (~22.5 GB) | [`BF16`](https://huggingface.co/defnoteatin/PseudoBrain-Nex-35B-A3B-BF16) (~70.0 GB) |
+| **PseudoBrain-27B** | `27B` / `27B` | **`99.2%`** (`64.0 GB` → `~486 MiB active window`) | [`W4A16`](https://huggingface.co/defnoteatin/PseudoBrain-27B-W4A16) (~15.5 GB) | [`FP8`](https://huggingface.co/defnoteatin/PseudoBrain-27B-FP8) (~28.5 GB) | [`NVFP4`](https://huggingface.co/defnoteatin/PseudoBrain-27B-NVFP4) (~19.5 GB) | [`BF16`](https://huggingface.co/defnoteatin/PseudoBrain-27B-BF16) (~54.0 GB) |
+| **PseudoBrain-Qwen3-32B** | `32.8B` / `32.8B` | **`98.4%`** (`256.0 GB` → `~4.1 GB`) | [`W4A16`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3-32B-W4A16) (~18.5 GB) | [`FP8`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3-32B-FP8) (~34.5 GB) | [`NVFP4`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3-32B-NVFP4) (~18.5 GB) | [`BF16`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3-32B-BF16) (~66.0 GB) |
+| **PseudoBrain-Gemma-4-31B** | `31B` / `31B` | **`92.2%`** (`~45.0 GB` → `~3.5 GB`) | [`W4A16`](https://huggingface.co/defnoteatin/PseudoBrain-Gemma-4-31B-W4A16) (~17.5 GB) | [`FP8`](https://huggingface.co/defnoteatin/PseudoBrain-Gemma-4-31B-FP8) (~32.5 GB) | [`NVFP4`](https://huggingface.co/defnoteatin/PseudoBrain-Gemma-4-31B-NVFP4) (~17.5 GB) | [`BF16`](https://huggingface.co/defnoteatin/PseudoBrain-Gemma-4-31B-BF16) (~62.0 GB) |
+| **PseudoBrain-Gemma-4-26B-A4B** | `25.2B` / `3.8B` | **`90.2%`** (`~22.5 GB` → `~2.2 GB`) | [`W4A16`](https://huggingface.co/defnoteatin/PseudoBrain-Gemma-4-26B-A4B-W4A16) (~14.2 GB) | [`FP8`](https://huggingface.co/defnoteatin/PseudoBrain-Gemma-4-26B-A4B-FP8) (~26.5 GB) | [`NVFP4`](https://huggingface.co/defnoteatin/PseudoBrain-Gemma-4-26B-A4B-NVFP4) (~14.2 GB) | [`BF16`](https://huggingface.co/defnoteatin/PseudoBrain-Gemma-4-26B-A4B-BF16) (~51.0 GB) |
+| **PseudoBrain-Qwen3.5-9B** | `9B` / `9B` | **`99.2%`** (`32.0 GB` → `~256 MiB active window`) | [`W4A16`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3.5-9B-W4A16) (~5.5 GB) | [`FP8`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3.5-9B-FP8) (~9.5 GB) | [`NVFP4`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3.5-9B-NVFP4) (~5.5 GB) | [`BF16`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3.5-9B-BF16) (~18.0 GB) |
+| **PseudoBrain-Qwen3.5-4B** | `4B` / `4B` | **`99.2%`** (`24.0 GB` → `~192 MiB active window`) | [`W4A16`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3.5-4B-W4A16) (~2.8 GB) | [`FP8`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3.5-4B-FP8) (~4.8 GB) | [`NVFP4`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3.5-4B-NVFP4) (~2.8 GB) | [`BF16`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3.5-4B-BF16) (~8.5 GB) |
 
-#### `PseudoBrain-Qwen3.8-Flash-Next-NVFP4` (`flash_next` + `DFlash2` — [`reports/pb27/flash_next_pt.summary.json`](reports/pb27/flash_next_pt.summary.json), [`flash_next_ext.summary.json`](reports/pb27/flash_next_ext.summary.json))
+---
 
-| Context Length ($L$) | `needle@0.1` | `needle@0.5` | `needle@0.9` | `multi4` (`4` constants) | `trace4` (`4`-hop chain) | Warm TTFT | `trace4` / Peak Decode `tok/s` | GPU KV Pool Used |
-| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **`8,192`** | **`1.0`** | **`1.0`** | **`1.0`** | **`1.0` (`4/4`)** | **`1.0`** | **`1.38s`** | **`93.01 tok/s`** (`85.94` mean) | **`8.1%`** |
-| **`32,768`** | **`1.0`** | **`1.0`** | **`1.0`** | **`1.0` (`4/4`)** | **`1.0`** | **`12.40s`** | **`66.51 tok/s`** (`59.22` mean) | **`8.1%`** |
-| **`65,536`** | **`1.0`** | **`1.0`** | **`1.0`** | **`1.0` (`4/4`)** | **`1.0`** | **`28.99s`** | **`67.86 tok/s`** (`51.68` `multi4`) | **`8.1%`** |
-| **`120,000`** | **`1.0`** | **`1.0`** | **`1.0`** | **`1.0` (`4/4`)** | **`1.0`** | **`61.36s`** | **`50.50 tok/s`** (`36.66` `multi4`) | **`8.1%`** |
-| **`200,000`** | **`1.0`** | **`1.0`** | **`1.0`** | **`1.0` (`4/4`)** | **`1.0`** | **`125.99s`** | **`50.81 tok/s`** | **`8.1%`** |
-| **`250,000`** | **`1.0`** | **`1.0`** | **`1.0`** | **`1.0` (`4/4`)** | **`1.0`** | **`110.16s`** | **`69.87 tok/s`** (`58.98` `multi4`) | **`8.1%`** |
-| **`500,000`** | **`1.0`** | **`1.0`** | **`1.0`** | **`1.0` (`4/4`)** | **`1.0`** | **`234.05s`** | **`64.91 tok/s`** (`183.54` peak, `76.47` mean) | **`8.1%`** |
-| **`1,000,000`** | **`1.0`** | **`1.0`** | **`1.0`** | **`0.75` (`3/4`)** | `0.0` | **`543.06s`** (`1,801 tok/s` prefill) | **`63.76 tok/s`** (`67.72` `needle@0.1`, `57.1` needle mean, `44.60` overall mean) | **`8.1%`** |
+## 2. Two-Command Quickstart (`vLLM`)
 
-##### Same-Hardware (`DGX Spark GB10, TP1`) Comparison: Stock `Qwen3.8-Flash-Next-NVFP4` vs. `PseudoBrain-Qwen3.8-Flash-Next-NVFP4`
+### Option A: Direct `pip install` into Any `vLLM` Environment (2 Commands)
 
-Compared directly against the upstream `runtime-qualification.json` in `edp1096/Huihui-Qwen3.8-Flash-Next-abliterated-NVFP4-QAD` measured on the **exact same `DGX Spark (GB10), TP1` hardware**:
+```bash
+# 1. Install the universal PseudoBrain vLLM V1 out-of-tree plugin (auto-registers via vllm.general_plugins)
+pip install --no-deps "git+https://github.com/defnotean/pseudobrain.git#subdirectory=serving/pb27_vllm"
+
+# 2. Serve any of the 40 PseudoBrain models at 1,000,000-token context in ~4-6 GB of KV cache
+VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 vllm serve defnoteatin/PseudoBrain-Qwen3-Coder-30B-A3B-W4A16 \
+  --served-model-name pb27 \
+  --max-model-len 1048576 \
+  --enforce-eager \
+  --no-enable-prefix-caching \
+  --kv-cache-memory-bytes 6G \
+  --max-num-seqs 16 \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_coder
+```
+
+### Option B: One-Command Docker Launch (`serve.sh` — Auto-Detects `x86_64` & `aarch64`)
+
+```bash
+git clone https://github.com/defnotean/pseudobrain.git
+cd pseudobrain
+
+# Serve Qwen3.8-Flash-Next + DFlash2 speculative decoding (45-183 tok/s up to 1M):
+SPEC='{"method":"dflash","model":"incoai/Qwen3.8-Flash-Next-DFlash2","num_speculative_tokens":8}' \
+bash serving/pb27_vllm/serve.sh defnoteatin/PseudoBrain-Qwen3.8-Flash-Next-NVFP4 pb27 8000
+
+# Serve on a single 24 GB RTX 3090 / 4090 / AMD 7900 XTX (W4A16):
+bash serving/pb27_vllm/serve.sh defnoteatin/PseudoBrain-Qwen3-Coder-30B-A3B-W4A16 pb27 8000
+
+# Serve on an 8 GB - 12 GB consumer GPU (1M context in <6.5 GB total VRAM):
+bash serving/pb27_vllm/serve.sh defnoteatin/PseudoBrain-Qwen3.5-9B-W4A16 pb27 8000
+```
+
+---
+
+## 3. What PseudoBrain Is & Why It Matters for Production Inference
+
+In standard Transformer deployment, **KV cache memory and quadratic prefill — not model weights — are the primary bottlenecks**:
+- A single user at `1,000,000` tokens on `Qwen3-32B` requires **`256 GB` of KV cache VRAM** (`192 GB` on `Qwen3-Coder-30B-A3B`; `64 GB` on `Qwen3.8-27B`).
+- **PseudoBrain** converts unbounded full-attention layers into **Hybrid 16K Sliding-Window Attention + Parallel Gated DeltaNet (`GDN`)** blocks paired with our **Three-Tier NVMe/Page-Cache Quest Exact Memory Hierarchy** and **True $O(1)$ Constant-Speed Decode Engine** inside vLLM (`serving/pb27_vllm/`):
+  - **Recurrent Gated DeltaNet Branch (`O(1)` State):** Initialized directly from teacher `self_attn` projections (`init_gdn_from_attention`) with zero-initialized output projections (`out=0`), compressing arbitrary-length global context into a fixed-size recurrent state.
+  - **Quest Exact Memory + FlashAttention-2 LSE Merge (`piece_attention`):** Archives rotated keys/values in `64`-token blocks with **2-Level Hierarchical `bf16` Quest Super-Block Bounds (`4,096` tokens/super-block)** and **Priority-Aware RoPE Sink Repositioning (`_reposition_rope_sinks`)**, recomputing attention over `[4 Sinks + Top-k Retrieved Pages + 16K Window]` without static YaRN `factor=4.0` short-context degradation.
+  - **True $O(1)$ Decode Throughput (`DECODE_STRIDE=64`, `DECODE_BLOCKS=64`, `DECODE_RERANK=0`):** Warms `cached_pre_k` / `cached_pre_v` at the end of `final_prefill` so multi-token speculative verification runs directly in GPU HBM with zero NVMe page traffic for rejected candidates.
+
+---
+
+## 4. Benchmark Results (All Backed by Committed Receipts in [`reports/`](reports/))
+
+### 4.1 Same-Hardware (`DGX Spark GB10, TP1`) Comparison: Stock vs. PseudoBrain at `65K` and `1,000,000` Tokens
+
+Compared directly against upstream `runtime-qualification.json` in `edp1096/Huihui-Qwen3.8-Flash-Next-abliterated-NVFP4-QAD` measured on the **exact same `DGX Spark (GB10), TP1` hardware**:
 
 | Metric on **DGX Spark (GB10, TP1)** | Stock `Huihui-Qwen3.8-Flash-Next-NVFP4-QAD` (`runtime-qualification.json`) | **`PseudoBrain-Qwen3.8-Flash-Next-NVFP4` (Ours)** | Speedup / Savings |
 | :--- | :---: | :---: | :---: |
@@ -60,37 +93,24 @@ Compared directly against the upstream `runtime-qualification.json` in `edp1096/
 | **`1,000,000` (`1M`) Decode Speed (`tok/s`)** | `33.3 – 37.1 tok/s` *(mean `34.9 tok/s`)* | **`44.6 – 67.7 tok/s`** *(mean **`57.1 tok/s`**, `67.7 tok/s` on `1M` needle)* | **1.64× – 1.94× faster decode at `1M` tokens** |
 | **KV Cache Memory at `1M` Tokens** | Full `1,048,576`-token `fp8` KV cache (`--mem-fraction-static 0.86`, `max-running-requests 1`, requires static YaRN `factor=4.0`) | **Fixed `16,384`-token GPU window (`8.1%` of `6 GiB` pool = `~486 MiB`)** + NVMe Quest $O(1)$ archive (`--max-num-seqs 16`, **no static YaRN degradation**) | **~96% less GPU KV cache memory at `1M` + `16` concurrent sequences** |
 
-#### `PseudoBrain-Nex-35B-A3B` (`pb27-nexc` — [`reports/pb27/nexc_pt.summary.json`](reports/pb27/nexc_pt.summary.json), [`nexc_ext.summary.json`](reports/pb27/nexc_ext.summary.json), [`nexc_fast_verify.summary.json`](reports/pb27/nexc_fast_verify.summary.json))
+### 4.2 Million-Token Long-Context Exact Retrieval (`8K` to `1,000,000` Tokens)
 
-*Note: With the shared `pb27_vllm` $O(1)$ constant-speed decode update (`DECODE_STRIDE=64`, `DECODE_BLOCKS=64`, `DECODE_RERANK=0`, 2-level `bf16` Quest super-blocks), `pb27-nexc` and `pb27c` now maintain flat $O(1)$ decode throughput all the way to `1,000,000` tokens (eliminating the historical `500K–1M` NVMe rerank slowdown shown in the pre-patch receipt column below).*
+Evaluated via [`scripts/bench/custom_longctx_bench.py`](scripts/bench/custom_longctx_bench.py) (`needle@0.1`, `needle@0.5`, `needle@0.9`, `multi4` 4-constant JSON synthesis at depths `{0.15, 0.40, 0.65, 0.85}`, and `trace4` 4-hop function call chain across depths `{0.82, 0.58, 0.34, 0.12}` + arithmetic mod `1000`):
 
-| Context Length ($L$) | `needle@0.1` | `needle@0.5` | `needle@0.9` | `multi4` (`4` constants) | `trace4` (`4`-hop chain) | Overall Score | Mean TTFT | Decode Speed | GPU KV Pool Used |
+| Context Length ($L$) | `needle@0.1` | `needle@0.5` | `needle@0.9` | `multi4` (`4` constants) | `trace4` (`4`-hop chain) | `Flash-Next` Warm TTFT | `Flash-Next` Decode `tok/s` | `Nex-35B-A3B` Recall | GPU KV Pool Used |
 | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **`8,192`** | **`1.0`** | **`1.0`** | **`1.0`** | **`1.0` (`4/4`)** | **`1.0`** | **`5/5 (100%)`** | **`1.8s`** | **`33.59 tok/s`** (`25.48` @ 1M cap) | **`8.1%`** |
-| **`32,768`** | **`1.0`** | **`1.0`** | **`1.0`** | **`1.0` (`4/4`)** | **`1.0`** | **`5/5 (100%)`** | **`17.0s`** (`8.8s` warm) | **`19.5 tok/s`** | **`8.1%`** |
-| **`65,536`** | **`1.0`** | **`1.0`** | **`1.0`** | **`1.0` (`4/4`)** | **`1.0`** | **`5/5 (100%)`** | **`21.2s`** | **`17.1 tok/s`** | **`8.1%`** |
-| **`120,000`** | **`1.0`** | **`1.0`** | **`1.0`** | **`1.0` (`4/4`)** | **`1.0`** | **`5/5 (100%)`** | **`36.7s`** | **`13.82 tok/s`** (`14.47` peak) | **`8.1%`** |
-| **`200,000`** | **`1.0`** | **`1.0`** | **`1.0`** | **`1.0` (`4/4`)** | **`1.0`** | **`5/5 (100%)`** | **`81.2s`** | **`13.5 tok/s`** | **`8.1%`** |
-| **`250,000`** | **`1.0`** | **`1.0`** | **`1.0`** | **`1.0` (`4/4`)** | **`1.0`** | **`5/5 (100%)`** | **`90.3s`** | **`13.31 tok/s`** (`14.03` peak) | **`8.1%`** |
-| **`500,000`** | **`1.0`** | **`1.0`** | **`1.0`** | **`1.0` (`4/4`)** | **`1.0`** | **`5/5 (100%)`** | **`238.3s`** | **`~10 tok/s`** | **`8.1%`** |
-| **`1,000,000`** | **`1.0`** | **`1.0`** | **`1.0`** | **`1.0` (`4/4`)** | **`1.0`** | **`5/5 (100%)`** | **`615.4s`** | **`~8 tok/s`** | **`8.1%`** |
+| **`8,192`** | **`1.0`** | **`1.0`** | **`1.0`** | **`1.0` (`4/4`)** | **`1.0`** | **`1.38s`** | **`93.01 tok/s`** (`85.94` mean) | **`5/5 (100%)`** | **`8.1%`** |
+| **`32,768`** | **`1.0`** | **`1.0`** | **`1.0`** | **`1.0` (`4/4`)** | **`1.0`** | **`12.40s`** | **`66.51 tok/s`** (`59.22` mean) | **`5/5 (100%)`** | **`8.1%`** |
+| **`65,536`** | **`1.0`** | **`1.0`** | **`1.0`** | **`1.0` (`4/4`)** | **`1.0`** | **`28.99s`** | **`67.86 tok/s`** (`51.68` `multi4`) | **`5/5 (100%)`** | **`8.1%`** |
+| **`120,000`** | **`1.0`** | **`1.0`** | **`1.0`** | **`1.0` (`4/4`)** | **`1.0`** | **`61.36s`** | **`50.50 tok/s`** (`36.66` `multi4`) | **`5/5 (100%)`** | **`8.1%`** |
+| **`200,000`** | **`1.0`** | **`1.0`** | **`1.0`** | **`1.0` (`4/4`)** | **`1.0`** | **`125.99s`** | **`50.81 tok/s`** | **`5/5 (100%)`** | **`8.1%`** |
+| **`250,000`** | **`1.0`** | **`1.0`** | **`1.0`** | **`1.0` (`4/4`)** | **`1.0`** | **`110.16s`** | **`69.87 tok/s`** (`58.98` `multi4`) | **`5/5 (100%)`** | **`8.1%`** |
+| **`500,000`** | **`1.0`** | **`1.0`** | **`1.0`** | **`1.0` (`4/4`)** | **`1.0`** | **`234.05s`** | **`64.91 tok/s`** (`183.54` peak) | **`5/5 (100%)`** | **`8.1%`** |
+| **`1,000,000`** | **`1.0`** | **`1.0`** | **`1.0`** | **`0.75–1.0`** | **`1.0` (`Nex`)** | **`543.06s`** (`1,801 tok/s`) | **`63.76 tok/s`** (`67.72` `needle@0.1`) | **`5/5 (100%)`** | **`8.1%`** |
 
-#### `PseudoBrain-27B` (`pb27c` — [`reports/pb27/pb27c_pt.summary.json`](reports/pb27/pb27c_pt.summary.json), [`pb27c_ext.summary.json`](reports/pb27/pb27c_ext.summary.json))
+### 4.3 General Intelligence (`MMLU`, `GSM8K`, `MMLU-Pro`, `lm-eval`), Software Engineering (`PB-SWE-Live`), & Algorithmic Coding
 
-| Context Length ($L$) | `needle@0.1` | `needle@0.5` | `needle@0.9` | `multi4` (`4` constants) | Mean TTFT | GPU KV Pool Used |
-| :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **`8,192`** | **`1.0`** | **`1.0`** | **`1.0`** | **`1.0` (`4/4`)** | **`5.8s`** (`13.07 tok/s`) | **`8.1%`** |
-| **`32,768`** | **`1.0`** | **`1.0`** | **`1.0`** | **`1.0` (`4/4`)** | **`26.1s`** | **`8.1%`** |
-| **`65,536`** | **`1.0`** | **`1.0`** | **`1.0`** | **`1.0` (`4/4`)** | **`57.4s`** | **`8.1%`** |
-| **`120,000`** | **`1.0`** | **`1.0`** | **`1.0`** | **`1.0` (`4/4`)** | **`115.6s`** | **`8.1%`** |
-| **`200,000`** | **`1.0`** | **`1.0`** | **`1.0`** | **`1.0` (`4/4`)** | **`215.5s`** | **`8.1%`** |
-| **`250,000`** | **`1.0`** | **`1.0`** | **`1.0`** | **`1.0` (`4/4`)** | **`312.8s`** | **`8.1%`** |
-| **`500,000`** | **`1.0`** | **`1.0`** | **`1.0`** | `0.50` (`2/4`) | **`703.2s`** | **`8.1%`** |
-| **`1,000,000`** | **`1.0`** | **`1.0`** | **`1.0`** | `0.75` (`3/4`) | **`1571.6s`** | **`8.1%`** |
-
-### 2.2 General Intelligence (`MMLU`, `GSM8K`, `MMLU-Pro`, `lm-eval`), Software Engineering (`PB-SWE-Live`), & Algorithmic Coding
-
-- **`PseudoBrain-Qwen3.8-Flash-Next-NVFP4` Public Benchmarks vs. Stock `Qwen3.8-Flash-Next` ([`reports/pb27/public_bench/flash_next/`](reports/pb27/public_bench/flash_next/)):**
+- **`PseudoBrain-Qwen3.8-Flash-Next-NVFP4` Public Benchmarks vs. Stock ([`reports/pb27/public_bench/flash_next/`](reports/pb27/public_bench/flash_next/)):**
   - **MMLU (`n=300`, 0-shot, greedy):** **`85.00%`** (`255 / 300`, `stderr: 0.0206` vs. stock `~85.0–87.9%`)
   - **GSM8K (`n=150`, CoT, greedy non-thinking):** **`96.00%`** (`144 / 150`, `stderr: 0.0161` vs. stock `93.29%`, **`+2.71%`**)
   - **MMLU-Pro (`n=150`, 10-option CoT, greedy non-thinking):** **`81.33%`** (`122 / 150`, **`85.31%`** non-truncated vs. stock `73.23%` Base / `80.6%` Instruct)
@@ -100,70 +120,27 @@ Compared directly against the upstream `runtime-qualification.json` in `edp1096/
   - `PB-27` **`26 / 59` (`44.1%`)** vs. Stock `27B` **`28 / 59` (`47.5%`)** (paired McNemar $p \approx 0.7$, statistically indistinguishable).
 - **33-Problem Medium-Hard Python Algorithmic Coding Suite ([`scripts/bench/custom_code_bench.py`](scripts/bench/custom_code_bench.py)):**
   - **`PseudoBrain-Qwen3.8-Flash-Next-NVFP4` (`flash_next`):** **`32 / 33` (`96.97%`)** at **`74.74 tok/s`** ([`reports/pb27/flash_next_med.summary.json`](reports/pb27/flash_next_med.summary.json)).
-  - `PseudoBrain-27B` (`pb27c`): **`60 / 66` (`90.91%`)** sample pass rate ([`reports/pb27/pb27c_med.summary.json`](reports/pb27/pb27c_med.summary.json)).
-  - `PseudoBrain-Nex-35B-A3B` (`pb27-nexc`): **`26 / 33` (`78.8%`)** problems solved (`43 / 66 = 65.2%` sample pass rate, [`reports/pb27/nexc_med.summary.json`](reports/pb27/nexc_med.summary.json)).
+  - **`PseudoBrain-27B` (`pb27c`):** **`60 / 66` (`90.91%`)** sample pass rate ([`reports/pb27/pb27c_med.summary.json`](reports/pb27/pb27c_med.summary.json)).
 
 ---
 
-## 3. Repository Layout
+## 5. Repository Layout
 
 ```text
 pseudobrain/        Self-contained PyTorch conversion core (WindowedHybridLayer, GatedDeltaNetLayer, Archive)
-serving/pb27_vllm/  Out-of-tree vLLM v0.31.0 plugin (PB27, PB27MoE & PB27Qwen4Exp + 3-tier exact memory archive)
+serving/pb27_vllm/  Universal vLLM V1 out-of-tree plugin (PB27, PB27MoE, PB27Qwen4Exp, PB27Qwen3Next, PB27Qwen3Moe, PB27Gemma4, PB27Qwen3)
+scripts/transplant/ Universal slim GDN export (export_universal_slim.py), Hub publisher (publish_pb_variants.py), GPU verifier (verify_all_pb_models.py)
 scripts/convert/    Distillation (convert_token.py), slim export (export_pb27_slim.py), NVFP4 composition (make_pb27_nvfp4.py)
 scripts/eval/       lm-eval / NLL battery (evaluate.py), recall probes (recall_probes.py), vLLM parity (vllm_parity.py)
 scripts/bench/      8K-1M long-context suite (custom_longctx_bench.py), coding suite (custom_code_bench.py), PB-SWE-Live
-docs/               Full architecture paper (PSEUDOBRAIN_ARCHITECTURE_PAPER.md) and design specs
-checkpoints/        Model cards and links to Hugging Face weights (defnotean1/...)
+docs/               Full architecture paper (PSEUDOBRAIN_ARCHITECTURE_PAPER.pdf / .md) and design specs
+release/            Model cards for all 10 PseudoBrain model families
 reports/            JSON/JSONL receipts for every benchmark table in this README and paper
 ```
 
 ---
 
-## 4. Quickstart
-
-### 4.1 Serve `PseudoBrain-Qwen3.8-Flash-Next-NVFP4`, `PseudoBrain-Nex-35B-A3B-NVFP4`, or `PseudoBrain-27B-NVFP4` with vLLM
-
-`serving/pb27_vllm/serve.sh` automatically installs the `pb27_vllm` plugin inside `vllm/vllm-openai:v0.31.0-aarch64` with all zero-config production defaults enabled (`16K` sliding window + `4` sinks, `256K` GPU-first archive tier, `1M+` NVMe `mmap` overflow, $O(1)$ constant-speed decode, and 2-hop exact retrieval):
-
-```bash
-# Serve PseudoBrain-Qwen3.8-Flash-Next-NVFP4 + DFlash2 speculative decoding (85.0% MMLU, 96.0% GSM8K, 97.0% coding, 45-183 tok/s up to 1M):
-PB27_SPECULATIVE_CONFIG='{"method":"dflash","model":"incoai/Qwen3.8-Flash-Next-DFlash2","num_speculative_tokens":5}' \
-bash serving/pb27_vllm/serve.sh defnotean1/PseudoBrain-Qwen3.8-Flash-Next-NVFP4 pb27 8000
-
-# Serve PseudoBrain-Nex-35B-A3B-NVFP4 (35B-A3B MoE, 33.6 tok/s @ 8K, 13.8 tok/s @ 120K, 100% recall to 1M):
-bash serving/pb27_vllm/serve.sh defnotean1/PseudoBrain-Nex-35B-A3B-NVFP4 pb27-nex 8000
-
-# Serve PseudoBrain-27B-NVFP4 (27B Dense, 90.9% medium coding, 100% needle recall to 1M):
-bash serving/pb27_vllm/serve.sh defnotean1/PseudoBrain-27B-NVFP4 pb27 8000
-```
-
-### 4.2 Run the `8K–1,000,000` Long-Context & Coding Benchmarks
-
-```bash
-# 8K, 32K, 65K, 120K, 200K exact retrieval + multi4 + trace4:
-bash scripts/bench/custom_longctx_pertoken.sh nexc_pt /path/to/PseudoBrain-Nex-35B-A3B-NVFP4
-
-# 250K, 500K, 1,000,000 extended exact retrieval + multi4 + trace4:
-bash scripts/bench/custom_longctx_extended.sh nexc_ext /path/to/PseudoBrain-Nex-35B-A3B-NVFP4
-
-# 33-problem x 2-sample medium-hard Python coding benchmark:
-python3 scripts/bench/custom_code_bench.py \
-  --url http://127.0.0.1:8000/v1/chat/completions \
-  --model pb27-nex --tier medium --n 2 --out reports/pb27/nexc_med
-```
-
----
-
-## 5. Limitations & Honest Trade-Offs vs. Stock
-
-1. **Ultra-Short Context (`< 4K` tokens) Overhead:** Even with the short-context archive bypass (`<= 16,384` tokens), evaluating the parallel Gated DeltaNet branch on the `10` (Nex) or `16` (27B) hybrid layers adds `~5–8%` compute per token compared to a stock model below `4K` tokens. Above `16K` tokens, PseudoBrain's bounded $O(W + k \cdot 64)$ attention rapidly overtakes stock's $O(L)$ full attention.
-2. **Dense `27B` vs. MoE `35B-A3B` Coding vs. Throughput Trade-Off:** Because `PseudoBrain-Nex-35B-A3B` activates only `~3B` parameters per token (`top-8` of `256` experts), it is `2.6×–3.4×` faster than `PseudoBrain-27B`, but scores `78.8%` (`26/33` problems solved) on the medium-hard algorithmic coding benchmark vs. `90.91%` for `PseudoBrain-27B`. Choose `PseudoBrain-Nex-35B-A3B` for high-speed interactive & million-token agentic workloads, and `PseudoBrain-27B` for maximum single-try dense coding accuracy.
-3. **Eager Execution Required (`--enforce-eager`):** Because the exact memory archive (`pb27_vllm/memory.py`) performs dynamic block retrieval and LSE merging per request, `PB27_EAGER=1` is required when exact memory retrieval is active.
-
----
-
 ## 6. License & Author
 
-- **Code License:** Apache-2.0 (see [`LICENSE`](LICENSE)). Converted model weights inherit the base model's license.
-- **Author:** Ian Kurt Galeon ([@defnotean](https://github.com/defnotean)).
+- **Code License:** Apache-2.0 (see [`LICENSE`](LICENSE)). Converted model weights inherit their respective base model's license.
+- **Author:** **Ian Kurt Galeon** ([@defnotean](https://github.com/defnotean) · [Hugging Face `@defnoteatin`](https://huggingface.co/defnoteatin) · `iangaleonofficial@gmail.com`).

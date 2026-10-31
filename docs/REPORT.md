@@ -2,8 +2,8 @@
 
 **Repository:** [https://github.com/defnotean/pseudobrain](https://github.com/defnotean/pseudobrain)  
 **Hugging Face Models:**
-- **PseudoBrain-27B (`pb27c` / `PB27ForConditionalGeneration`):** [defnotean1/PseudoBrain-27B-NVFP4](https://huggingface.co/defnotean1/PseudoBrain-27B-NVFP4) — 27B Dense Hybrid (`48` native Gated DeltaNet layers + `16` converted Windowed-Attention + Parallel Gated DeltaNet layers `[3, 7, ..., 63]`)
-- **PseudoBrain-Nex-35B-A3B (`pb27-nexc` / `PB27MoEForConditionalGeneration`):** [defnotean1/PseudoBrain-Nex-35B-A3B-NVFP4](https://huggingface.co/defnotean1/PseudoBrain-Nex-35B-A3B-NVFP4) — 35B-A3B Sparse MoE Hybrid (`30` native Gated DeltaNet layers + `10` converted Windowed-Attention + Parallel Gated DeltaNet layers `[3, 7, ..., 39]`, `256` routed experts + `1` shared expert, `top-8` active = `~3B` active parameters)
+- **PseudoBrain-27B (`pb27c` / `PB27ForConditionalGeneration`):** [defnoteatin/PseudoBrain-27B-NVFP4](https://huggingface.co/defnoteatin/PseudoBrain-27B-NVFP4) — 27B Dense Hybrid (`48` native Gated DeltaNet layers + `16` converted Windowed-Attention + Parallel Gated DeltaNet layers `[3, 7, ..., 63]`)
+- **PseudoBrain-Nex-35B-A3B (`pb27-nexc` / `PB27MoEForConditionalGeneration`):** [defnoteatin/PseudoBrain-Nex-35B-A3B-NVFP4](https://huggingface.co/defnoteatin/PseudoBrain-Nex-35B-A3B-NVFP4) — 35B-A3B Sparse MoE Hybrid (`30` native Gated DeltaNet layers + `10` converted Windowed-Attention + Parallel Gated DeltaNet layers `[3, 7, ..., 39]`, `256` routed experts + `1` shared expert, `top-8` active = `~3B` active parameters)
 
 ---
 

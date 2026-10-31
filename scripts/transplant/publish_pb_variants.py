@@ -9,8 +9,10 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import struct
+import urllib.request
 from pathlib import Path
-from huggingface_hub import CommitOperationAdd, CommitOperationCopy, HfApi, hf_hub_download
+from huggingface_hub import CommitOperationAdd, CommitOperationCopy, HfApi, hf_hub_download, hf_hub_url
 
 COPY_SMALL = (
     "tokenizer.json",
@@ -39,6 +41,14 @@ GDN_SUBMODULES = ("", ".in_proj_qkv", ".in_proj_z", ".in_proj_a", ".in_proj_b", 
 
 VARIANTS = {
     # 1. PseudoBrain-27B (pb27c)
+    "pb27-nvfp4": {
+        "target_repo": "defnoteatin/PseudoBrain-27B-NVFP4",
+        "base_repo": "huihui-ai/Huihui-Qwen3.8-27B-abliterated",
+        "slim_dir": "/home/defnotean/pb27/hf/pb27c",
+        "gdn_ckpt_path": "pb27c/pb27-gdn-00001-of-00001.safetensors",
+        "readme_path": "/home/defnotean/pb27/release/pb27c/README.md",
+        "old_repo_str": "PseudoBrain-27B-NVFP4",
+    },
     "pb27-bf16": {
         "target_repo": "defnoteatin/PseudoBrain-27B-BF16",
         "base_repo": "huihui-ai/Huihui-Qwen3.8-27B-abliterated",
@@ -64,6 +74,14 @@ VARIANTS = {
         "old_repo_str": "PseudoBrain-27B-NVFP4",
     },
     # 2. PseudoBrain-Nex-35B-A3B (nexc)
+    "nex-nvfp4": {
+        "target_repo": "defnoteatin/PseudoBrain-Nex-35B-A3B-NVFP4",
+        "base_repo": "nex-agi/Nex-N2.5-mini",
+        "slim_dir": "/home/defnotean/pb27/hf/nexc",
+        "gdn_ckpt_path": "nexc/pb27-gdn-00001-of-00001.safetensors",
+        "readme_path": "/home/defnotean/pb27/release/pb27_nex/README.md",
+        "old_repo_str": "PseudoBrain-Nex-35B-A3B-NVFP4",
+    },
     "nex-bf16": {
         "target_repo": "defnoteatin/PseudoBrain-Nex-35B-A3B-BF16",
         "base_repo": "nex-agi/Nex-N2.5-mini",
@@ -89,6 +107,14 @@ VARIANTS = {
         "old_repo_str": "PseudoBrain-Nex-35B-A3B-NVFP4",
     },
     # 3. PseudoBrain-Qwen3.8-Flash-Next (flash_next)
+    "flash-nvfp4": {
+        "target_repo": "defnoteatin/PseudoBrain-Qwen3.8-Flash-Next-NVFP4",
+        "base_repo": "edp1096/Huihui-Qwen3.8-Flash-Next-abliterated-NVFP4-QAD",
+        "slim_dir": "/home/defnotean/pb27/hf/flash_next_gdn_slim",
+        "gdn_ckpt_path": "flash_next/pb27-gdn-00001-of-00001.safetensors",
+        "readme_path": "/home/defnotean/pb27/release/flash_next/README.md",
+        "old_repo_str": "PseudoBrain-Qwen3.8-Flash-Next-NVFP4",
+    },
     "flash-bf16": {
         "target_repo": "defnoteatin/PseudoBrain-Qwen3.8-Flash-Next-BF16",
         "base_repo": "Qwen/Qwen3.8-Flash-Next",
@@ -113,7 +139,255 @@ VARIANTS = {
         "readme_path": "/home/defnotean/pb27/release/flash_next/README.md",
         "old_repo_str": "PseudoBrain-Qwen3.8-Flash-Next-NVFP4",
     },
+    # 4. PseudoBrain-Qwen3.5-9B (qwen35_9b)
+    "qwen35-9b-bf16": {
+        "target_repo": "defnoteatin/PseudoBrain-Qwen3.5-9B-BF16",
+        "base_repo": "Qwen/Qwen3.5-9B",
+        "slim_dir": "/home/defnotean/pb27/hf/qwen35_9b_slim",
+        "gdn_ckpt_path": "qwen35_9b/pb27-gdn-00001-of-00001.safetensors",
+        "readme_path": "/home/defnotean/pb27/release/qwen35_9b/README.md",
+        "old_repo_str": "PseudoBrain-Qwen3.5-9B-W4A16",
+    },
+    "qwen35-9b-w4a16": {
+        "target_repo": "defnoteatin/PseudoBrain-Qwen3.5-9B-W4A16",
+        "base_repo": "cyankiwi/Qwen3.5-9B-AWQ-4bit",
+        "slim_dir": "/home/defnotean/pb27/hf/qwen35_9b_slim",
+        "gdn_ckpt_path": "qwen35_9b/pb27-gdn-00001-of-00001.safetensors",
+        "readme_path": "/home/defnotean/pb27/release/qwen35_9b/README.md",
+        "old_repo_str": "PseudoBrain-Qwen3.5-9B-W4A16",
+    },
+    "qwen35-9b-fp8": {
+        "target_repo": "defnoteatin/PseudoBrain-Qwen3.5-9B-FP8",
+        "base_repo": "RedHatAI/Qwen3.5-9B-FP8-dynamic",
+        "slim_dir": "/home/defnotean/pb27/hf/qwen35_9b_slim",
+        "gdn_ckpt_path": "qwen35_9b/pb27-gdn-00001-of-00001.safetensors",
+        "readme_path": "/home/defnotean/pb27/release/qwen35_9b/README.md",
+        "old_repo_str": "PseudoBrain-Qwen3.5-9B-W4A16",
+    },
+    "qwen35-9b-nvfp4": {
+        "target_repo": "defnoteatin/PseudoBrain-Qwen3.5-9B-NVFP4",
+        "base_repo": "ig1/Qwen3.5-9B-NVFP4",
+        "slim_dir": "/home/defnotean/pb27/hf/qwen35_9b_slim",
+        "gdn_ckpt_path": "qwen35_9b/pb27-gdn-00001-of-00001.safetensors",
+        "readme_path": "/home/defnotean/pb27/release/qwen35_9b/README.md",
+        "old_repo_str": "PseudoBrain-Qwen3.5-9B-W4A16",
+    },
+    # 5. PseudoBrain-Qwen3.5-4B (qwen35_4b)
+    "qwen35-4b-bf16": {
+        "target_repo": "defnoteatin/PseudoBrain-Qwen3.5-4B-BF16",
+        "base_repo": "Qwen/Qwen3.5-4B",
+        "slim_dir": "/home/defnotean/pb27/hf/qwen35_4b_slim",
+        "gdn_ckpt_path": "qwen35_4b/pb27-gdn-00001-of-00001.safetensors",
+        "readme_path": "/home/defnotean/pb27/release/qwen35_4b/README.md",
+        "old_repo_str": "PseudoBrain-Qwen3.5-4B-W4A16",
+    },
+    "qwen35-4b-w4a16": {
+        "target_repo": "defnoteatin/PseudoBrain-Qwen3.5-4B-W4A16",
+        "base_repo": "cyankiwi/Qwen3.5-4B-AWQ-4bit",
+        "slim_dir": "/home/defnotean/pb27/hf/qwen35_4b_slim",
+        "gdn_ckpt_path": "qwen35_4b/pb27-gdn-00001-of-00001.safetensors",
+        "readme_path": "/home/defnotean/pb27/release/qwen35_4b/README.md",
+        "old_repo_str": "PseudoBrain-Qwen3.5-4B-W4A16",
+    },
+    "qwen35-4b-fp8": {
+        "target_repo": "defnoteatin/PseudoBrain-Qwen3.5-4B-FP8",
+        "base_repo": "surogate/Qwen3.5-4B-FP8",
+        "slim_dir": "/home/defnotean/pb27/hf/qwen35_4b_slim",
+        "gdn_ckpt_path": "qwen35_4b/pb27-gdn-00001-of-00001.safetensors",
+        "readme_path": "/home/defnotean/pb27/release/qwen35_4b/README.md",
+        "old_repo_str": "PseudoBrain-Qwen3.5-4B-W4A16",
+    },
+    "qwen35-4b-nvfp4": {
+        "target_repo": "defnoteatin/PseudoBrain-Qwen3.5-4B-NVFP4",
+        "base_repo": "AxionML/Qwen3.5-4B-NVFP4",
+        "slim_dir": "/home/defnotean/pb27/hf/qwen35_4b_slim",
+        "gdn_ckpt_path": "qwen35_4b/pb27-gdn-00001-of-00001.safetensors",
+        "readme_path": "/home/defnotean/pb27/release/qwen35_4b/README.md",
+        "old_repo_str": "PseudoBrain-Qwen3.5-4B-W4A16",
+    },
+    # 6. PseudoBrain-Qwen3-Coder-Next (qwen3_coder_next)
+    "coder-next-bf16": {
+        "target_repo": "defnoteatin/PseudoBrain-Qwen3-Coder-Next-BF16",
+        "base_repo": "Qwen/Qwen3-Coder-Next",
+        "slim_dir": "/home/defnotean/pb27/hf/qwen3_coder_next_slim",
+        "gdn_ckpt_path": "qwen3_coder_next/pb27-gdn-00001-of-00001.safetensors",
+        "readme_path": "/home/defnotean/pb27/release/qwen3_coder_next/README.md",
+        "old_repo_str": "PseudoBrain-Qwen3-Coder-Next-W4A16",
+    },
+    "coder-next-w4a16": {
+        "target_repo": "defnoteatin/PseudoBrain-Qwen3-Coder-Next-W4A16",
+        "base_repo": "qtum/Qwen3-Coder-Next-AWQ",
+        "slim_dir": "/home/defnotean/pb27/hf/qwen3_coder_next_slim",
+        "gdn_ckpt_path": "qwen3_coder_next/pb27-gdn-00001-of-00001.safetensors",
+        "readme_path": "/home/defnotean/pb27/release/qwen3_coder_next/README.md",
+        "old_repo_str": "PseudoBrain-Qwen3-Coder-Next-W4A16",
+    },
+    "coder-next-fp8": {
+        "target_repo": "defnoteatin/PseudoBrain-Qwen3-Coder-Next-FP8",
+        "base_repo": "Qwen/Qwen3-Coder-Next-FP8",
+        "slim_dir": "/home/defnotean/pb27/hf/qwen3_coder_next_slim",
+        "gdn_ckpt_path": "qwen3_coder_next/pb27-gdn-00001-of-00001.safetensors",
+        "readme_path": "/home/defnotean/pb27/release/qwen3_coder_next/README.md",
+        "old_repo_str": "PseudoBrain-Qwen3-Coder-Next-W4A16",
+    },
+    "coder-next-nvfp4": {
+        "target_repo": "defnoteatin/PseudoBrain-Qwen3-Coder-Next-NVFP4",
+        "base_repo": "RedHatAI/Qwen3-Coder-Next-NVFP4",
+        "slim_dir": "/home/defnotean/pb27/hf/qwen3_coder_next_slim",
+        "gdn_ckpt_path": "qwen3_coder_next/pb27-gdn-00001-of-00001.safetensors",
+        "readme_path": "/home/defnotean/pb27/release/qwen3_coder_next/README.md",
+        "old_repo_str": "PseudoBrain-Qwen3-Coder-Next-W4A16",
+    },
+    # 7. PseudoBrain-Qwen3-Coder-30B-A3B (qwen3_coder_30b)
+    "coder-30b-bf16": {
+        "target_repo": "defnoteatin/PseudoBrain-Qwen3-Coder-30B-A3B-BF16",
+        "base_repo": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+        "slim_dir": "/home/defnotean/pb27/hf/qwen3_coder_30b_slim",
+        "gdn_ckpt_path": "qwen3_coder_30b/pb27-gdn-00001-of-00001.safetensors",
+        "readme_path": "/home/defnotean/pb27/release/qwen3_coder_30b/README.md",
+        "old_repo_str": "PseudoBrain-Qwen3-Coder-30B-A3B-W4A16",
+    },
+    "coder-30b-w4a16": {
+        "target_repo": "defnoteatin/PseudoBrain-Qwen3-Coder-30B-A3B-W4A16",
+        "base_repo": "cyankiwi/Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit",
+        "slim_dir": "/home/defnotean/pb27/hf/qwen3_coder_30b_slim",
+        "gdn_ckpt_path": "qwen3_coder_30b/pb27-gdn-00001-of-00001.safetensors",
+        "readme_path": "/home/defnotean/pb27/release/qwen3_coder_30b/README.md",
+        "old_repo_str": "PseudoBrain-Qwen3-Coder-30B-A3B-W4A16",
+    },
+    "coder-30b-fp8": {
+        "target_repo": "defnoteatin/PseudoBrain-Qwen3-Coder-30B-A3B-FP8",
+        "base_repo": "Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8",
+        "slim_dir": "/home/defnotean/pb27/hf/qwen3_coder_30b_slim",
+        "gdn_ckpt_path": "qwen3_coder_30b/pb27-gdn-00001-of-00001.safetensors",
+        "readme_path": "/home/defnotean/pb27/release/qwen3_coder_30b/README.md",
+        "old_repo_str": "PseudoBrain-Qwen3-Coder-30B-A3B-W4A16",
+    },
+    "coder-30b-nvfp4": {
+        "target_repo": "defnoteatin/PseudoBrain-Qwen3-Coder-30B-A3B-NVFP4",
+        "base_repo": "NVFP4/Qwen3-Coder-30B-A3B-Instruct-FP4",
+        "slim_dir": "/home/defnotean/pb27/hf/qwen3_coder_30b_slim",
+        "gdn_ckpt_path": "qwen3_coder_30b/pb27-gdn-00001-of-00001.safetensors",
+        "readme_path": "/home/defnotean/pb27/release/qwen3_coder_30b/README.md",
+        "old_repo_str": "PseudoBrain-Qwen3-Coder-30B-A3B-W4A16",
+    },
+    # 8. PseudoBrain-Gemma-4-26B-A4B (gemma4_26b)
+    "gemma4-26b-bf16": {
+        "target_repo": "defnoteatin/PseudoBrain-Gemma-4-26B-A4B-BF16",
+        "base_repo": "google/gemma-4-26B-A4B-it",
+        "slim_dir": "/home/defnotean/pb27/hf/gemma4_26b_slim",
+        "gdn_ckpt_path": "gemma4_26b/pb27-gdn-00001-of-00001.safetensors",
+        "readme_path": "/home/defnotean/pb27/release/gemma4_26b/README.md",
+        "old_repo_str": "PseudoBrain-Gemma-4-26B-A4B-W4A16",
+    },
+    "gemma4-26b-w4a16": {
+        "target_repo": "defnoteatin/PseudoBrain-Gemma-4-26B-A4B-W4A16",
+        "base_repo": "cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit",
+        "slim_dir": "/home/defnotean/pb27/hf/gemma4_26b_slim",
+        "gdn_ckpt_path": "gemma4_26b/pb27-gdn-00001-of-00001.safetensors",
+        "readme_path": "/home/defnotean/pb27/release/gemma4_26b/README.md",
+        "old_repo_str": "PseudoBrain-Gemma-4-26B-A4B-W4A16",
+    },
+    "gemma4-26b-fp8": {
+        "target_repo": "defnoteatin/PseudoBrain-Gemma-4-26B-A4B-FP8",
+        "base_repo": "RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic",
+        "slim_dir": "/home/defnotean/pb27/hf/gemma4_26b_slim",
+        "gdn_ckpt_path": "gemma4_26b/pb27-gdn-00001-of-00001.safetensors",
+        "readme_path": "/home/defnotean/pb27/release/gemma4_26b/README.md",
+        "old_repo_str": "PseudoBrain-Gemma-4-26B-A4B-W4A16",
+    },
+    "gemma4-26b-nvfp4": {
+        "target_repo": "defnoteatin/PseudoBrain-Gemma-4-26B-A4B-NVFP4",
+        "base_repo": "RedHatAI/gemma-4-26B-A4B-it-NVFP4",
+        "slim_dir": "/home/defnotean/pb27/hf/gemma4_26b_slim",
+        "gdn_ckpt_path": "gemma4_26b/pb27-gdn-00001-of-00001.safetensors",
+        "readme_path": "/home/defnotean/pb27/release/gemma4_26b/README.md",
+        "old_repo_str": "PseudoBrain-Gemma-4-26B-A4B-W4A16",
+    },
+    # 9. PseudoBrain-Gemma-4-31B (gemma4_31b)
+    "gemma4-31b-bf16": {
+        "target_repo": "defnoteatin/PseudoBrain-Gemma-4-31B-BF16",
+        "base_repo": "google/gemma-4-31B-it",
+        "slim_dir": "/home/defnotean/pb27/hf/gemma4_31b_slim",
+        "gdn_ckpt_path": "gemma4_31b/pb27-gdn-00001-of-00001.safetensors",
+        "readme_path": "/home/defnotean/pb27/release/gemma4_31b/README.md",
+        "old_repo_str": "PseudoBrain-Gemma-4-31B-W4A16",
+    },
+    "gemma4-31b-w4a16": {
+        "target_repo": "defnoteatin/PseudoBrain-Gemma-4-31B-W4A16",
+        "base_repo": "cyankiwi/gemma-4-31B-it-AWQ-4bit",
+        "slim_dir": "/home/defnotean/pb27/hf/gemma4_31b_slim",
+        "gdn_ckpt_path": "gemma4_31b/pb27-gdn-00001-of-00001.safetensors",
+        "readme_path": "/home/defnotean/pb27/release/gemma4_31b/README.md",
+        "old_repo_str": "PseudoBrain-Gemma-4-31B-W4A16",
+    },
+    "gemma4-31b-fp8": {
+        "target_repo": "defnoteatin/PseudoBrain-Gemma-4-31B-FP8",
+        "base_repo": "RedHatAI/gemma-4-31B-it-FP8-dynamic",
+        "slim_dir": "/home/defnotean/pb27/hf/gemma4_31b_slim",
+        "gdn_ckpt_path": "gemma4_31b/pb27-gdn-00001-of-00001.safetensors",
+        "readme_path": "/home/defnotean/pb27/release/gemma4_31b/README.md",
+        "old_repo_str": "PseudoBrain-Gemma-4-31B-W4A16",
+    },
+    "gemma4-31b-nvfp4": {
+        "target_repo": "defnoteatin/PseudoBrain-Gemma-4-31B-NVFP4",
+        "base_repo": "RedHatAI/gemma-4-31B-it-NVFP4",
+        "slim_dir": "/home/defnotean/pb27/hf/gemma4_31b_slim",
+        "gdn_ckpt_path": "gemma4_31b/pb27-gdn-00001-of-00001.safetensors",
+        "readme_path": "/home/defnotean/pb27/release/gemma4_31b/README.md",
+        "old_repo_str": "PseudoBrain-Gemma-4-31B-W4A16",
+    },
+    # 10. PseudoBrain-Qwen3-32B (qwen3_32b)
+    "qwen3-32b-bf16": {
+        "target_repo": "defnoteatin/PseudoBrain-Qwen3-32B-BF16",
+        "base_repo": "Qwen/Qwen3-32B",
+        "slim_dir": "/home/defnotean/pb27/hf/qwen3_32b_slim",
+        "gdn_ckpt_path": "qwen3_32b/pb27-gdn-00001-of-00001.safetensors",
+        "readme_path": "/home/defnotean/pb27/release/qwen3_32b/README.md",
+        "old_repo_str": "PseudoBrain-Qwen3-32B-W4A16",
+    },
+    "qwen3-32b-w4a16": {
+        "target_repo": "defnoteatin/PseudoBrain-Qwen3-32B-W4A16",
+        "base_repo": "Qwen/Qwen3-32B-AWQ",
+        "slim_dir": "/home/defnotean/pb27/hf/qwen3_32b_slim",
+        "gdn_ckpt_path": "qwen3_32b/pb27-gdn-00001-of-00001.safetensors",
+        "readme_path": "/home/defnotean/pb27/release/qwen3_32b/README.md",
+        "old_repo_str": "PseudoBrain-Qwen3-32B-W4A16",
+    },
+    "qwen3-32b-fp8": {
+        "target_repo": "defnoteatin/PseudoBrain-Qwen3-32B-FP8",
+        "base_repo": "Qwen/Qwen3-32B-FP8",
+        "slim_dir": "/home/defnotean/pb27/hf/qwen3_32b_slim",
+        "gdn_ckpt_path": "qwen3_32b/pb27-gdn-00001-of-00001.safetensors",
+        "readme_path": "/home/defnotean/pb27/release/qwen3_32b/README.md",
+        "old_repo_str": "PseudoBrain-Qwen3-32B-W4A16",
+    },
+    "qwen3-32b-nvfp4": {
+        "target_repo": "defnoteatin/PseudoBrain-Qwen3-32B-NVFP4",
+        "base_repo": "RedHatAI/Qwen3-32B-NVFP4",
+        "slim_dir": "/home/defnotean/pb27/hf/qwen3_32b_slim",
+        "gdn_ckpt_path": "qwen3_32b/pb27-gdn-00001-of-00001.safetensors",
+        "readme_path": "/home/defnotean/pb27/release/qwen3_32b/README.md",
+        "old_repo_str": "PseudoBrain-Qwen3-32B-W4A16",
+    },
 }
+
+
+def _fetch_single_shard_index(repo_id: str, token: str | None, shard_name: str = "model.safetensors") -> dict:
+    url = hf_hub_url(repo_id=repo_id, filename=shard_name)
+    headers = {"Range": "bytes=0-7"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        raw_len = resp.read(8)
+    hdr_len = struct.unpack("<Q", raw_len)[0]
+    headers["Range"] = f"bytes=8-{8 + hdr_len - 1}"
+    req2 = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req2, timeout=60) as resp2:
+        hdr = json.loads(resp2.read(hdr_len).decode("utf-8"))
+    weight_map = {k: shard_name for k in hdr if k != "__metadata__"}
+    return {"metadata": hdr.get("__metadata__", {}), "weight_map": weight_map}
 
 
 def publish_one(api: HfApi, key: str, spec: dict, plugin_root: Path, cache_dir: Path) -> None:
@@ -127,9 +401,12 @@ def publish_one(api: HfApi, key: str, spec: dict, plugin_root: Path, cache_dir: 
 
     base_files = set(api.list_repo_files(base_repo))
     qcfg_p = hf_hub_download(base_repo, "config.json", cache_dir=str(cache_dir), token=api.token)
-    qidx_p = hf_hub_download(base_repo, "model.safetensors.index.json", cache_dir=str(cache_dir), token=api.token)
     qcfg = json.loads(Path(qcfg_p).read_text())
-    qidx = json.loads(Path(qidx_p).read_text())
+    if "model.safetensors.index.json" in base_files:
+        qidx_p = hf_hub_download(base_repo, "model.safetensors.index.json", cache_dir=str(cache_dir), token=api.token)
+        qidx = json.loads(Path(qidx_p).read_text())
+    else:
+        qidx = _fetch_single_shard_index(base_repo, api.token, "model.safetensors")
 
     scfg = json.loads((slim_dir / "config.json").read_text())
     sidx = json.loads((slim_dir / "model.safetensors.index.json").read_text())
@@ -269,10 +546,14 @@ def publish_one(api: HfApi, key: str, spec: dict, plugin_root: Path, cache_dir: 
             rel = p.relative_to(plugin_root.parent).as_posix()
             ops.append(CommitOperationAdd(path_in_repo=rel, path_or_fileobj=str(p)))
 
-    # 6. Add README.md
+    # 6. Add README.md (prefer precision-specific README_<PREC>.md if present)
     readme_p = Path(spec["readme_path"])
+    prec_suffix = target_repo.split("-")[-1].upper()
+    prec_readme_p = readme_p.parent / f"README_{prec_suffix}.md"
+    if prec_readme_p.is_file():
+        readme_p = prec_readme_p
     if readme_p.is_file():
-        rtext = readme_p.read_text()
+        rtext = readme_p.read_text(encoding="utf-8")
         new_repo_name = target_repo.split("/")[-1]
         rtext = rtext.replace("defnotean1/", "defnoteatin/").replace(spec["old_repo_str"], new_repo_name)
         ops.append(CommitOperationAdd(path_in_repo="README.md", path_or_fileobj=rtext.encode("utf-8")))
@@ -286,8 +567,37 @@ def publish_one(api: HfApi, key: str, spec: dict, plugin_root: Path, cache_dir: 
     print(f"DONE {target_repo}: {info.commit_url} ({len(kept_base_shards)} base shards)")
 
 
+def update_readme_and_plugin_only(api: HfApi, key: str, spec: dict, plugin_root: Path) -> None:
+    target_repo = spec["target_repo"]
+    ops = []
+    for p in sorted(plugin_root.rglob("*")):
+        if p.is_file() and "__pycache__" not in str(p):
+            rel = p.relative_to(plugin_root.parent).as_posix()
+            ops.append(CommitOperationAdd(path_in_repo=rel, path_or_fileobj=str(p)))
+
+    readme_p = Path(spec["readme_path"])
+    prec_suffix = target_repo.split("-")[-1].upper()
+    prec_readme_p = readme_p.parent / f"README_{prec_suffix}.md"
+    if prec_readme_p.is_file():
+        readme_p = prec_readme_p
+    if readme_p.is_file():
+        rtext = readme_p.read_text(encoding="utf-8")
+        new_repo_name = target_repo.split("/")[-1]
+        rtext = rtext.replace("defnotean1/", "defnoteatin/").replace(spec["old_repo_str"], new_repo_name)
+        ops.append(CommitOperationAdd(path_in_repo="README.md", path_or_fileobj=rtext.encode("utf-8")))
+
+    info = api.create_commit(
+        repo_id=target_repo,
+        repo_type="model",
+        operations=ops,
+        commit_message=f"Update Model Card README.md and pb27_vllm_plugin v0.2.0 for {target_repo}",
+    )
+    print(f"UPDATED {target_repo}: {info.commit_url}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--readme-and-plugin-only", action="store_true", help="Only update README.md and pb27_vllm_plugin")
     ap.add_argument("keys", nargs="*", default=list(VARIANTS.keys()))
     args = ap.parse_args()
 
@@ -298,7 +608,10 @@ def main() -> None:
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     for k in args.keys:
-        publish_one(api, k, VARIANTS[k], plugin_root, cache_dir)
+        if args.readme_and_plugin_only:
+            update_readme_and_plugin_only(api, k, VARIANTS[k], plugin_root)
+        else:
+            publish_one(api, k, VARIANTS[k], plugin_root, cache_dir)
     shutil.rmtree(cache_dir, ignore_errors=True)
 
 

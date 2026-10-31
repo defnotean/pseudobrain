@@ -17,6 +17,13 @@ QWEN4_EXP_ARCHS = (
     "PB27Qwen4ExpForConditionalGeneration",
     "PB27Qwen4ExpForCausalLM",
 )
+UNIVERSAL_ARCHS = (
+    "PB27Qwen3NextForCausalLM",
+    "PB27Qwen3MoeForCausalLM",
+    "PB27Qwen3ForCausalLM",
+    "PB27Gemma4ForCausalLM",
+    "PB27Gemma4ForConditionalGeneration",
+)
 
 
 def register() -> None:
@@ -25,10 +32,17 @@ def register() -> None:
     from vllm.config import vllm as vllm_cfg
     from vllm.model_executor.models.config import (
         MODELS_CONFIG_MAP,
+        Gemma4Config,
         Qwen3_5ForCausalLMConfig,
         Qwen3_5ForConditionalGenerationConfig,
         _strip_qwen4_exp_mrope,
     )
+
+    class PB27Gemma4Config(Gemma4Config):
+        @staticmethod
+        def verify_and_update_config(vllm_config) -> None:
+            Qwen3_5ForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+            Gemma4Config.verify_and_update_config(vllm_config)
 
     class PB27Qwen4ExpForConditionalGenerationConfig(
         Qwen3_5ForConditionalGenerationConfig
@@ -97,6 +111,9 @@ def register() -> None:
     for arch in QWEN4_EXP_ARCHS:
         if arch not in ModelRegistry.get_supported_archs():
             ModelRegistry.register_model(arch, f"pb27_vllm.qwen4_exp_model:{arch}")
+    for arch in UNIVERSAL_ARCHS:
+        if arch not in ModelRegistry.get_supported_archs():
+            ModelRegistry.register_model(arch, f"pb27_vllm.universal_models:{arch}")
 
     # The verify-and-update hooks of the stock Qwen3.5 classes (mamba SSM cache
     # dtype from the HF config; the CausalLM variant also drops the M-RoPE
@@ -106,9 +123,16 @@ def register() -> None:
         MODELS_CONFIG_MAP.setdefault(arch, Qwen3_5ForConditionalGenerationConfig)
     for arch in ("PB27ForCausalLM", "PB27MoeForCausalLM"):
         MODELS_CONFIG_MAP.setdefault(arch, Qwen3_5ForCausalLMConfig)
-    # The Llama path only needs the mamba SSM cache dtype hook (no M-RoPE fields to drop).
-    for arch in LLAMA_ARCHS:
+    # The Llama / Qwen3Next / Qwen3Moe / Qwen3 paths only need the mamba SSM cache dtype hook (no M-RoPE fields to drop).
+    for arch in (
+        *LLAMA_ARCHS,
+        "PB27Qwen3NextForCausalLM",
+        "PB27Qwen3MoeForCausalLM",
+        "PB27Qwen3ForCausalLM",
+    ):
         MODELS_CONFIG_MAP.setdefault(arch, Qwen3_5ForConditionalGenerationConfig)
+    for arch in ("PB27Gemma4ForCausalLM", "PB27Gemma4ForConditionalGeneration"):
+        MODELS_CONFIG_MAP.setdefault(arch, PB27Gemma4Config)
     MODELS_CONFIG_MAP.setdefault(
         "PB27Qwen4ExpForConditionalGeneration",
         PB27Qwen4ExpForConditionalGenerationConfig,

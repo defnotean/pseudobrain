@@ -171,6 +171,14 @@ def pb27_hybrid_config(vllm_config: VllmConfig) -> tuple[frozenset[int], int | N
     return frozenset(int(i) for i in hybrid), window
 
 
+def pb27_spatial_config(vllm_config: VllmConfig) -> tuple[frozenset[int], int]:
+    spatial = _pb_field(vllm_config, "pb_spatial_layers")
+    inter = int(_pb_field(vllm_config, "pb_spatial_intermediate_size", 0) or 0)
+    if not spatial or inter <= 0:
+        return frozenset(), 0
+    return frozenset(int(i) for i in spatial), inter
+
+
 # --------------------------------------------------------------------------
 # windowed attention
 # --------------------------------------------------------------------------
@@ -335,6 +343,8 @@ class PB27DecoderLayer(Qwen3_5DecoderLayer):
         prefix: str = "",
         hybrid_layers: frozenset[int] = frozenset(),
         attention_window: int | None = None,
+        spatial_layers: frozenset[int] = frozenset(),
+        spatial_intermediate_size: int = 0,
     ) -> None:
         super(Qwen3NextDecoderLayer, self).__init__()
 
@@ -347,6 +357,7 @@ class PB27DecoderLayer(Qwen3_5DecoderLayer):
         self.layer_type = layer_type
         self.layer_idx = extract_layer_index(prefix)
         self.is_pb_hybrid = self.layer_idx in hybrid_layers
+        self.is_pb_spatial = self.layer_idx in spatial_layers and spatial_intermediate_size > 0
         is_moe_layer = config.model_type == "qwen3_5_moe_text"
         self.use_attn_reduce_scatter_for_moe = (
             parallel_config.use_sequence_parallel_moe
@@ -417,6 +428,17 @@ class PB27DecoderLayer(Qwen3_5DecoderLayer):
             )
         else:
             raise ValueError(f"Invalid model_type {config.model_type}")
+
+        if self.is_pb_spatial:
+            self.spatial_mlp = Qwen3NextMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=spatial_intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                prefix=f"{prefix}.spatial_mlp",
+            )
+        else:
+            self.spatial_mlp = None
 
         self.input_layernorm = Qwen3_5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -492,14 +514,16 @@ class PB27DecoderLayer(Qwen3_5DecoderLayer):
             hidden_states = torch.nn.functional.pad(hidden_states, (0, 0, 0, sp_pad))
             hidden_states = tensor_model_parallel_reduce_scatter(hidden_states, 0)
 
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        normed_ffn, residual = self.post_attention_layernorm(hidden_states, residual)
         if self.use_attn_reduce_scatter_for_moe:
             hidden_states = self.mlp(
-                hidden_states,
+                normed_ffn,
                 already_sequence_parallel=True,
             )
         else:
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.mlp(normed_ffn)
+        if self.spatial_mlp is not None:
+            hidden_states = hidden_states + self.spatial_mlp(normed_ffn)
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
@@ -563,13 +587,18 @@ class PB27Model(Qwen3_5Model):
         )
 
         hybrid_layers, attention_window = pb27_hybrid_config(vllm_config)
+        spatial_layers, spatial_inter = pb27_spatial_config(vllm_config)
         self.pb_hybrid_layers = hybrid_layers
         self.pb_attention_window = attention_window
+        self.pb_spatial_layers = spatial_layers
+        self.pb_spatial_intermediate_size = spatial_inter
         logger.info(
-            "PB27: %d hybrid layers %s, attention window %s",
+            "PB27: %d hybrid layers %s, attention window %s, %d spatial layers (inter=%d)",
             len(hybrid_layers),
             sorted(hybrid_layers),
             attention_window,
+            len(spatial_layers),
+            spatial_inter,
         )
 
         def get_layer(prefix: str):
@@ -579,6 +608,8 @@ class PB27Model(Qwen3_5Model):
                 prefix=prefix,
                 hybrid_layers=hybrid_layers,
                 attention_window=attention_window,
+                spatial_layers=spatial_layers,
+                spatial_intermediate_size=spatial_inter,
             )
 
         self.start_layer, self.end_layer, self.layers = make_layers(

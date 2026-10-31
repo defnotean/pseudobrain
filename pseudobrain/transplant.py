@@ -197,7 +197,7 @@ class TeacherConfig:
         text = config.get("text_config") or config
         kind = config.get("model_type", "llama")
         if kind not in ("llama", "qwen2", "mistral", "qwen3_5", "qwen3_5_text", "qwen3_5_moe",
-                        "qwen3_5_moe_text"):
+                        "qwen3_5_moe_text", "qwen4_exp", "qwen4_exp_text"):
             raise ValueError(f"unsupported teacher model_type {kind!r}")
         heads = int(text["num_attention_heads"])
         width = int(text["hidden_size"])
@@ -208,7 +208,7 @@ class TeacherConfig:
         theta = float(rope.get("rope_theta") or text.get("rope_theta") or 10000.0)
         factor = float(rope.get("partial_rotary_factor") or text.get("partial_rotary_factor") or 1.0)
         tie = text.get("tie_word_embeddings", config.get("tie_word_embeddings"))
-        hybrid = kind.startswith("qwen3_5")
+        hybrid = kind.startswith(("qwen3_5", "qwen4_exp"))
         return cls(
             vocab=int(text["vocab_size"]), width=width, layers=int(text["num_hidden_layers"]),
             heads=heads, kv_heads=int(text.get("num_key_value_heads") or heads), head_dim=head_dim,
@@ -219,7 +219,7 @@ class TeacherConfig:
             eos_id=text.get("eos_token_id", config.get("eos_token_id")), model_type=kind,
             layer_types=tuple(text.get("layer_types") or ()),
             rotary_dim=int(head_dim * factor) if factor != 1.0 else 0,
-            attn_output_gate=bool(text.get("attn_output_gate", False)), qk_norm=hybrid,
+            attn_output_gate=bool(text.get("attn_output_gate", bool(text.get("output_gate_type")))), qk_norm=hybrid,
             zero_centered_norm=hybrid,
             linear_key_heads=int(text.get("linear_num_key_heads") or 0),
             linear_value_heads=int(text.get("linear_num_value_heads") or 0),
@@ -998,7 +998,7 @@ class WindowedHybridLayer(nn.Module):
 
     def forward(self, x):
         x = x + self.mix(x).to(x.dtype)
-        return x + self.residual_scale * self.mlp(x).to(x.dtype)
+        return x + mlp_branch(self, x)
 
 
 def _zero_state(block: GatedDeltaNetLayer, x: torch.Tensor):
@@ -1025,7 +1025,13 @@ def mixer_delta(block: nn.Module, x: torch.Tensor, positions: torch.Tensor | Non
 
 
 def mlp_branch(block: nn.Module, x: torch.Tensor) -> torch.Tensor:
-    return block.residual_scale * block.mlp(x).to(x.dtype)
+    out = block.mlp(x).to(x.dtype)
+    s_mlp = getattr(block, "spatial_mlp", None)
+    if s_mlp is not None and getattr(s_mlp, "enabled", True):
+        h = block.mlp.norm(x).to(s_mlp.gate_up.weight.dtype)
+        gate, up = s_mlp.gate_up(h).chunk(2, dim=-1)
+        out = out + s_mlp.down(F.silu(gate) * up).to(x.dtype)
+    return block.residual_scale * out
 
 
 def _state_step(block: nn.Module, x: torch.Tensor, st, positions=None):
@@ -1894,6 +1900,8 @@ def pb27_config(config: dict, hybrid: Sequence[int], window: int | None, sinks: 
         config.update(linear_num_key_heads=int(gdn["heads"]), linear_key_head_dim=int(gdn["key_dim"]),
                       linear_num_value_heads=int(gdn["value_heads"]), linear_value_head_dim=int(gdn["value_dim"]),
                       linear_conv_kernel_dim=int(gdn["conv"]), mamba_ssm_dtype="float32")
+    elif kind.startswith("qwen4_exp"):
+        config["architectures"] = ["PB27Qwen4ExpForConditionalGeneration"]
     else:
         moe = "moe" in kind
         config["architectures"] = ["PB27MoeForConditionalGeneration" if moe else "PB27ForConditionalGeneration"]
@@ -1901,6 +1909,13 @@ def pb27_config(config: dict, hybrid: Sequence[int], window: int | None, sinks: 
         target["pb_hybrid_layers"] = [int(i) for i in hybrid]
         target["pb_attention_window"] = window
         target["pb_attention_sinks"] = int(sinks)
+        if gdn:
+            target.setdefault("linear_num_key_heads", int(gdn["heads"]))
+            target.setdefault("linear_key_head_dim", int(gdn["key_dim"]))
+            target.setdefault("linear_num_value_heads", int(gdn["value_heads"]))
+            target.setdefault("linear_value_head_dim", int(gdn["value_dim"]))
+            target.setdefault("linear_conv_kernel_dim", int(gdn["conv"]))
+            target.setdefault("mamba_ssm_dtype", "float32")
     return config
 
 
@@ -2037,6 +2052,102 @@ def export_hf_qwen35(core: "TokenCore", teacher_path: str | Path, out_dir: str |
                 "config.json", "model.safetensors.index.json"):
             shutil.copy(extra, out / extra.name)
     return {"layers": types, "hybrid": hybrid, "shards": len(shards), "tensors": len(tensors)}
+
+
+@torch.no_grad()
+def load_pb27_gdn_shard(core: "TokenCore", shard_path: str | Path) -> list[int]:
+    """Load a PB-27 `pb27-gdn-00001-of-00001.safetensors` shard directly into a `TokenCore`'s
+    `WindowedHybridLayer.gdn` branches (undoing the HF `1/sqrt(L)` division by multiplying `out_proj` by `sqrt(L)`)."""
+    reader = SafeTensors(shard_path)
+    root = math.sqrt(core.c.layers)
+    loaded = []
+    for i, block in enumerate(core.blocks):
+        if not isinstance(block, WindowedHybridLayer):
+            continue
+        p = f"model.language_model.layers.{i}.gdn."
+        if p + "in_proj_qkv.weight" not in reader:
+            p = f"model.layers.{i}.gdn."
+        if p + "in_proj_qkv.weight" not in reader:
+            continue
+        gdn = block.gdn
+        dev, dt = gdn.proj.weight.device, gdn.proj.weight.dtype
+        qkv = reader.get(p + "in_proj_qkv.weight", torch.float32).to(dev)
+        z = reader.get(p + "in_proj_z.weight", torch.float32).to(dev)
+        a = reader.get(p + "in_proj_a.weight", torch.float32).to(dev)
+        b = reader.get(p + "in_proj_b.weight", torch.float32).to(dev)
+        gdn.proj.weight.copy_(torch.cat((qkv, z, a, b), dim=0).to(dt))
+        gdn.conv_weight.copy_(reader.get(p + "conv1d.weight", torch.float32).to(dev).reshape(gdn.channels, -1).to(dt))
+        gdn.A_log.copy_(reader.get(p + "A_log", torch.float32).to(dev).to(gdn.A_log.dtype))
+        gdn.dt_bias.copy_(reader.get(p + "dt_bias", torch.float32).to(dev).to(gdn.dt_bias.dtype))
+        gdn.o_norm.copy_(reader.get(p + "norm.weight", torch.float32).to(dev).to(gdn.o_norm.dtype))
+        gdn.out.weight.copy_((reader.get(p + "out_proj.weight", torch.float32).to(dev) * root).to(dt))
+        loaded.append(i)
+    return loaded
+
+
+def attach_spatial_mlp(core: "TokenCore", layers: Sequence[int], hidden: int = 7552,
+                       dtype: torch.dtype = torch.bfloat16) -> list[nn.Parameter]:
+    """Attach zero-output parallel SwiGLU `spatial_mlp` branches (`+1.856B` params at `hidden=7552` across 16 layers)
+    to the specified decoder layers of `core`, freezing all existing parameters and returning the trainable parameters."""
+    from .scan import SwiGLU
+    for p in core.parameters():
+        p.requires_grad_(False)
+    params: list[nn.Parameter] = []
+    dev = core.embed.weight.device
+    for i in layers:
+        block = core.blocks[int(i)]
+        s_mlp = SwiGLU(core.c.width, hidden, zero_output=True, norm="rms", norm_eps=core.c.norm_eps).to(device=dev, dtype=dtype)
+        s_mlp.norm = nn.Identity()
+        s_mlp.enabled = True
+        with torch.no_grad():
+            s_mlp.down.weight.zero_()
+        block.spatial_mlp = s_mlp
+        for p in s_mlp.parameters():
+            p.requires_grad_(True)
+            params.append(p)
+    return params
+
+
+import contextlib as _contextlib
+
+
+@_contextlib.contextmanager
+def spatial_bypassed(core: "TokenCore"):
+    """Temporarily disable attached `spatial_mlp` branches so `core` computes the exact base `pb27c` outputs."""
+    mods = [getattr(b, "spatial_mlp", None) for b in core.blocks if getattr(b, "spatial_mlp", None) is not None]
+    prev = [getattr(m, "enabled", True) for m in mods]
+    for m in mods:
+        m.enabled = False
+    try:
+        yield
+    finally:
+        for m, p in zip(mods, prev):
+            m.enabled = p
+
+
+@torch.no_grad()
+def export_pb27_spatial_shard(core: "TokenCore", layers: Sequence[int], out_path: str | Path,
+                              dtype: torch.dtype = torch.bfloat16) -> dict:
+    """Export the trained `spatial_mlp` branches of `core` to an HF safetensors shard
+    (`model.language_model.layers.{i}.spatial_mlp.{gate_proj,up_proj,down_proj}.weight`)."""
+    root = math.sqrt(core.c.layers)
+    tensors: dict[str, torch.Tensor] = {}
+    for i in layers:
+        block = core.blocks[int(i)]
+        s_mlp = getattr(block, "spatial_mlp", None)
+        if s_mlp is None:
+            continue
+        base = f"model.language_model.layers.{int(i)}.spatial_mlp."
+        gate, up = s_mlp.gate_up.weight.detach().float().chunk(2, dim=0)
+        down = s_mlp.down.weight.detach().float() / root
+        tensors[base + "gate_proj.weight"] = gate.to("cpu", dtype).contiguous()
+        tensors[base + "up_proj.weight"] = up.to("cpu", dtype).contiguous()
+        tensors[base + "down_proj.weight"] = down.to("cpu", dtype).contiguous()
+    out_p = Path(out_path).expanduser()
+    out_p.parent.mkdir(parents=True, exist_ok=True)
+    write_safetensors(out_p, tensors)
+    return {"path": str(out_p), "layers": [int(i) for i in layers], "tensors": len(tensors),
+            "params": sum(t.numel() for t in tensors.values())}
 
 
 def copy_exact_layers(dst: "TokenCore", src: "TokenCore") -> list[int]:

@@ -4,11 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pb27-vllm"
-version = "0.1.0"
-description = "vLLM out-of-tree model plug-in for PB-27 (Qwen3.8-27B with windowed attention + parallel Gated DeltaNet on the hybrid layers)"
+version = "0.2.0"
+description = "Universal vLLM V1 out-of-tree plugin for PseudoBrain 1M-context hybrid Gated DeltaNet + Quest Exact Memory models (Qwen3.8, Qwen3.5, Qwen3-Coder-Next, Qwen3-Coder-30B, Qwen3-32B, Gemma-4)"
+authors = [
+  {name = "Ian Kurt Galeon", email = "iangaleonofficial@gmail.com"}
+]
 requires-python = ">=3.10"
-# vLLM itself is provided by the serving container (vllm/vllm-openai:v0.31.0); it is
-# deliberately not a dependency here so `pip install -e` never tries to resolve it.
+# vLLM itself is provided by the serving environment or container; it is deliberately
+# not listed as a hard dependency so `pip install` never overwrites an existing vLLM/PyTorch build.
 dependencies = []
 
 [project.entry-points."vllm.general_plugins"]

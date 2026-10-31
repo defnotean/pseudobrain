@@ -28,6 +28,13 @@ serve = [
   "vllm>=0.6.0",
 ]
 
+[project.entry-points."vllm.general_plugins"]
+pb27 = "pb27_vllm:register"
+
+[tool.setuptools.package-dir]
+"" = "."
+"pb27_vllm" = "serving/pb27_vllm/pb27_vllm"
+
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["pseudobrain*", "efficiency*", "learning*"]
+where = [".", "serving/pb27_vllm"]
+include = ["pseudobrain*", "efficiency*", "learning*", "pb27_vllm*"]
