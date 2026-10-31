@@ -22,7 +22,7 @@ tags:
   - nvfp4
 ---
 
-# PseudoBrain-Qwen3.8-Flash-Next-NVFP4 — 1M-Context Ultra-Sparse 36B-A1.7B MoE + PLE + DFlash2 Speculative Decoding (`45–183 tok/s`)
+# PseudoBrain-Qwen3.8-Flash-Next-NVFP4 — 1M-Context Ultra-Sparse 125B-A6B (+51B N-gram PLE) MoE + DFlash2 Speculative Decoding (`45–183 tok/s`)
 
 > [!IMPORTANT]
 > **Created by Ian Kurt Galeon ([@defnotean](https://github.com/defnotean) · [Hugging Face `@defnoteatin`](https://huggingface.co/defnoteatin) · `iangaleonofficial@gmail.com`)**  
@@ -37,7 +37,7 @@ tags:
 In standard Transformer serving, **model weights are paid once, while KV cache memory grows linearly ($O(L)$) and prefill compute grows quadratically ($O(L^2)$)** — forcing long-context (`128K–1,000,000` token) workloads to OOM even when the GPU easily fits the model weights.
 
 **`PseudoBrain-Qwen3.8-Flash-Next-NVFP4`** (`PB27Qwen4ExpForConditionalGeneration`) solves this via the **PseudoBrain architecture**:
-1. **Hybrid Windowed-Attention + Parallel Gated DeltaNet (`GDN`):** 48 layers: 36 native Gated DeltaNet + 12 full-attention layers (`[3, 7, 11, ..., 47]`) converted into 16K SWA + Parallel Gated DeltaNet + Quest Exact Memory. Recurrent GDN state is **$O(1)$ fixed size** regardless of whether context is `4K` or `1,000,000` tokens.
+1. **Hybrid Windowed-Attention + Parallel Gated DeltaNet (`GDN`):** 48 layers: 36 native Gated DeltaNet + 12 QSA/attention layers (`[3, 7, 11, ..., 47]`) converted into 16K SWA + Parallel Gated DeltaNet + Quest Exact Memory. Recurrent GDN state is **$O(1)$ fixed size** regardless of whether context is `4K` or `1,000,000` tokens.
 2. **Three-Tier NVMe/Page-Cache Quest Exact Memory (`piece_attention`):** On the sparse anchor layers, queries attend over `[4 StreamingLLM Sinks + Top-k Quest Exact-Memory Pages + 16,384 Sliding Window]` via FlashAttention-2 LSE-merge (`pb27_vllm/memory.py`) with **2-Level Hierarchical `bf16` Quest Super-Block Bounds (`PB27_MEMORY_SUPERBLOCK=64`)** and **Priority-Aware RoPE Sink Repositioning (`_reposition_rope_sinks`)**.
 3. **True $O(1)$ Constant-Speed Decode up to `1,000,000` Tokens:** Decouples the scaled prefill retrieval budget from the constant decode budget (`PB27_MEMORY_DECODE_STRIDE=64`, `PB27_MEMORY_DECODE_BLOCKS=64`, `PB27_MEMORY_DECODE_RERANK=0`), cutting **1M-token KV cache memory by `96.0%+`** (`~48.0 GB (or static YaRN 4.0x degradation)` → **`~486 MiB active window (4.7 GB pool for 1.15M tokens)`**).
 
@@ -45,10 +45,10 @@ In standard Transformer serving, **model weights are paid once, while KV cache m
 
 | Repository | Precision | Model Weights | **Total VRAM at `1,000,000` Tokens** | Target GPUs |
 | :--- | :---: | :---: | :---: | :--- |
-| [`defnoteatin/PseudoBrain-Qwen3.8-Flash-Next-W4A16`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3.8-Flash-Next-W4A16) | **`W4A16`** | `~21.0 GB` | **`~26.0 GB`** | RTX 3090 / 4090 (24 GB, 18 shards PLE-pruned), RTX 5090 (32 GB), AMD RX 7900 XTX / MI300X |
-| [`defnoteatin/PseudoBrain-Qwen3.8-Flash-Next-FP8`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3.8-Flash-Next-FP8) | **`FP8`** | `~36.5 GB` | **`~42.0 GB`** | L40S / A100 / H100, 2x RTX 4090, DGX Spark (128 GB), AMD Instinct MI300X |
-| [`defnoteatin/PseudoBrain-Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3.8-Flash-Next-NVFP4) **(This Repo)** | **`NVFP4`** | `~21.0 GB` | **`~27.5 GB`** | NVIDIA Blackwell (DGX Spark GB10, RTX 5090 32 GB, RTX PRO 6000, B200) |
-| [`defnoteatin/PseudoBrain-Qwen3.8-Flash-Next-BF16`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3.8-Flash-Next-BF16) | **`BF16`** | `~72.0 GB` | **`~78.0 GB`** | H100 / H200 (80 GB+), DGX Spark (128 GB), AMD MI300X, Multi-GPU CUDA / ROCm |
+| [`defnoteatin/PseudoBrain-Qwen3.8-Flash-Next-W4A16`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3.8-Flash-Next-W4A16) | **`W4A16`** | `~90.2 GB` | **`~95.5 GB`** | DGX Spark (128 GB, 19 shards PLE-pruned), RTX PRO 6000 (96 GB), H200 / MI300X, 4x RTX 3090/4090 |
+| [`defnoteatin/PseudoBrain-Qwen3.8-Flash-Next-FP8`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3.8-Flash-Next-FP8) | **`FP8`** | `~185.5 GB` | **`~191.0 GB`** | AMD Instinct MI300X (192 GB), 2x H200 (282 GB), 3x A100/H100 (240 GB) |
+| [`defnoteatin/PseudoBrain-Qwen3.8-Flash-Next-NVFP4`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3.8-Flash-Next-NVFP4) **(This Repo)** | **`NVFP4`** | `~106.3 GB` | **`~111.5 GB`** | Single 128 GB NVIDIA DGX Spark (GB10), B200 (192 GB), 2x RTX PRO 6000 Blackwell |
+| [`defnoteatin/PseudoBrain-Qwen3.8-Flash-Next-BF16`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3.8-Flash-Next-BF16) | **`BF16`** | `~360.0 GB` | **`~366.0 GB`** | 2x AMD MI300X (384 GB), 4x H200, 8x A100/H100 |
 
 ---
 
@@ -158,7 +158,7 @@ All 40 repositories share the single unified `pb27_vllm` plugin (`pip install --
 
 | Model Family | Params (Total / Active) | 1M KV Reduction | **4-Bit `W4A16` (RTX 30/40/AMD)** | **8-Bit `FP8` (4090/H100/MI300X)** | **4-Bit `NVFP4` (Blackwell/Spark)** | **16-Bit `BF16` (Universal)** |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **PseudoBrain-Qwen3.8-Flash-Next** | `36B` / `~1.7B` | **`96.0%+`** (`~48.0 GB` → `~486 MiB active window`) | [`W4A16`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3.8-Flash-Next-W4A16) (~21.0 GB) | [`FP8`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3.8-Flash-Next-FP8) (~36.5 GB) | [`NVFP4`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3.8-Flash-Next-NVFP4) (~21.0 GB) | [`BF16`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3.8-Flash-Next-BF16) (~72.0 GB) |
+| **PseudoBrain-Qwen3.8-Flash-Next** | `125B (+51B PLE)` / `6B` | **`96.0%+`** (`~48.0 GB` → `~486 MiB active window`) | [`W4A16`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3.8-Flash-Next-W4A16) (~90.2 GB) | [`FP8`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3.8-Flash-Next-FP8) (~185.5 GB) | [`NVFP4`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3.8-Flash-Next-NVFP4) (~106.3 GB) | [`BF16`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3.8-Flash-Next-BF16) (~360.0 GB) |
 | **PseudoBrain-Qwen3-Coder-Next** | `80B` / `3.0B` | **`93.5%`** (`~48.0 GB` → `~3.1 GB`) | [`W4A16`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3-Coder-Next-W4A16) (~41.5 GB) | [`FP8`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3-Coder-Next-FP8) (~80.5 GB) | [`NVFP4`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3-Coder-Next-NVFP4) (~41.5 GB) | [`BF16`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3-Coder-Next-BF16) (~160.0 GB) |
 | **PseudoBrain-Qwen3-Coder-30B-A3B** | `30.5B` / `3.3B` | **`98.4%`** (`192.0 GB` → `~3.1 GB`) | [`W4A16`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3-Coder-30B-A3B-W4A16) (~16.5 GB) | [`FP8`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3-Coder-30B-A3B-FP8) (~31.0 GB) | [`NVFP4`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3-Coder-30B-A3B-NVFP4) (~16.5 GB) | [`BF16`](https://huggingface.co/defnoteatin/PseudoBrain-Qwen3-Coder-30B-A3B-BF16) (~61.0 GB) |
 | **PseudoBrain-Nex-35B-A3B** | `35B` / `~3.0B` | **`97.6%`** (`~20.0 GB` → `~486 MiB active window`) | [`W4A16`](https://huggingface.co/defnoteatin/PseudoBrain-Nex-35B-A3B-W4A16) (~18.5 GB) | [`FP8`](https://huggingface.co/defnoteatin/PseudoBrain-Nex-35B-A3B-FP8) (~35.0 GB) | [`NVFP4`](https://huggingface.co/defnoteatin/PseudoBrain-Nex-35B-A3B-NVFP4) (~22.5 GB) | [`BF16`](https://huggingface.co/defnoteatin/PseudoBrain-Nex-35B-A3B-BF16) (~70.0 GB) |
